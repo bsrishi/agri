@@ -1,6 +1,18 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx";
 
+// ---- API base (same pattern as Login) ----
+const API_BASE = (() => {
+  const env = (import.meta as any)?.env?.VITE_API_URL || (window as any).__API_URL__ || "";
+  return String(env || "").replace(/\/+$/, "");
+})();
+
+/** Wrapper that prefixes API_BASE and forces JSON by default */
+function apiFetch(path: string, init: RequestInit = {}) {
+  const url = `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}`;
+  return fetch(url, init);
+}
+
 
 /**
  * BulkJobs
@@ -378,7 +390,7 @@ const BulkJobs: React.FC = () => {
                 }
                 const searchNumber = clsForSend.normalized;
                 const token = localStorage.getItem("sla_token");
-                const r = await fetch("/api/search/number", {
+                const r = await apiFetch("/api/search/number", {
                     method: "POST",
                     headers: {
                         "Content-Type": "application/json",
@@ -449,7 +461,7 @@ const BulkJobs: React.FC = () => {
             try {
                 const nums = rows.map(r => r.number);
                 const token = localStorage.getItem("sla_token");
-                const r = await fetch("/api/bulk/start", {
+                const r = await apiFetch("/api/bulk/start", {
                     method: "POST",
                     headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
                     body: JSON.stringify({ numbers: nums })
@@ -581,7 +593,7 @@ const BulkJobs: React.FC = () => {
     async function fetchLatestServerJobId(): Promise<string | null> {
         try {
             const token = localStorage.getItem("sla_token");
-            const r = await fetch("/api/bulk/latest", {
+            const r = await apiFetch("/api/bulk/latest", {
                 headers: { "Accept": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) }
             });
             if (!r.ok) return null;
@@ -636,7 +648,7 @@ const BulkJobs: React.FC = () => {
         if (!jobId) return;
         try {
             const token = localStorage.getItem("sla_token");
-            const r = await fetch(`/api/bulk/${jobId}/status`, {
+            const r = await apiFetch(`/api/bulk/${jobId}/status`, {
                 headers: {
                     "Accept": "application/json",
                     ...(token ? { Authorization: `Bearer ${token}` } : {}),
@@ -750,7 +762,7 @@ const BulkJobs: React.FC = () => {
         try {
             const token = localStorage.getItem("sla_token");
             // Preferred endpoint
-            let r = await fetch(`/api/bulk/recent?days=${days}`, {
+        let r = await apiFetch(`/api/bulk/recent?days=${days}`, {
                 headers: { "Accept": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) }
             });
             if (r.ok && (r.headers.get("content-type") || "").toLowerCase().includes("application/json")) {
@@ -794,7 +806,7 @@ const BulkJobs: React.FC = () => {
         if (!id) return;
         try {
             const token = localStorage.getItem("sla_token");
-            const r = await fetch(`/api/bulk/${id}/status`, {
+            const r = await apiFetch(`/api/bulk/${id}/status`, {
                 headers: {
                     "Accept": "application/json",
                     ...(token ? { Authorization: `Bearer ${token}` } : {}),

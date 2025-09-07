@@ -4,6 +4,10 @@ import Input from "../components/ui/Input";
 import Button from "../components/ui/Button";
 import Timeline from "../components/ui/Timeline";
 
+const API_BASE = (import.meta as any)?.env?.VITE_API_URL
+  ? String((import.meta as any).env.VITE_API_URL).replace(/\/+$/, "")
+  : "";
+
 // --- Lightweight local caches (used after successful fetch). We do not prefill UI during a new search so old IDs vanish. ---
 const APPS_CACHE_KEY = "sla_cache_apps_by_number"; // { [number]: { ts, apps } }
 const STATUS_CACHE_KEY = "sla_cache_status_by_app"; // { [appId]: { ts, statuses } }
@@ -183,6 +187,40 @@ function splitSurveys(input?: string): string[] {
   );
 }
 
+// ---- Robust fetch helpers (timeout + safe JSON parsing) ----
+async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, ms = 30000): Promise<Response> {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+/**
+ * Read a response body safely as JSON.
+ * - Returns `null` for 204/empty body.
+ * - Throws a helpful Error if the body isn't JSON or JSON.parse fails (includes status and a snippet).
+ */
+async function readJsonSafe(r: Response): Promise<any> {
+  const ct = r.headers.get("content-type") || "";
+  if (r.status === 204) return null;
+  const text = await r.text(); // read once
+  if (!text) return null;
+  const looksJson = /\bapplication\/json\b/i.test(ct) || /^[\s]*[{\[]/.test(text);
+  if (!looksJson) {
+    const snippet = text.slice(0, 180).replace(/\s+/g, " ");
+    throw new Error(`Unexpected non-JSON response (${r.status} ${r.statusText}; ${ct || "no content-type"}). Body: ${snippet}`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch (e) {
+    const snippet = text.slice(0, 180).replace(/\s+/g, " ");
+    throw new Error(`Invalid JSON from server (${r.status}). Body starts: ${snippet}`);
+  }
+}
+
 /** Normalize a single application row to be UI-friendly */
 function normalizeApp(a: AppRow): AppRow {
   // keep original applied_date text for display if parsing fails; otherwise ISO yyyy-mm-dd for consistency
@@ -334,6 +372,7 @@ export default function FetchInfo() {
   const [showBanner, setShowBanner] = useState(false);
   const bannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const [iframeErr, setIframeErr] = useState<string | null>(null);
   // Rotating loading messages while government sources are slow
   const rotatingPhrases = React.useMemo(() => [
     "Searching…",
@@ -371,16 +410,26 @@ export default function FetchInfo() {
     };
   }, []);
 
-  // Set iframe sandbox via attribute (avoids DOMTokenList "string did not match the expected pattern")
+  // Safely set iframe src via attribute (avoid DOM setter quirks)
   React.useEffect(() => {
+    setIframeErr(null);
     const f = iframeRef.current;
     if (!f) return;
+    if (!viewAppId) {
+      try { f.removeAttribute('src'); } catch {}
+      return;
+    }
     try {
-      f.setAttribute("sandbox", "allow-same-origin allow-scripts allow-forms allow-popups");
-    } catch {
-      // ignore
+      const url = `${API_BASE}/api/tn-print/${encodeURIComponent(String(viewAppId))}`;
+      // Use setAttribute to bypass any property-level validation bugs
+      f.setAttribute('src', url);
+    } catch (e: any) {
+      console.error('iframe src set error:', e?.message || e);
+      setIframeErr(e?.message || 'Unable to display preview');
+      try { f.removeAttribute('src'); } catch {}
     }
   }, [viewAppId]);
+
 
   async function copyAppId(id: string) {
     try {
@@ -585,7 +634,7 @@ export default function FetchInfo() {
 
   async function fetchStatusesFor(appId: string, strategy: "local-first" | "local-only" = "local-first") {
     try {
-      const r = await fetch("/api/search/application", {
+      const r = await fetchWithTimeout(`${API_BASE}/api/search/application`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -593,8 +642,11 @@ export default function FetchInfo() {
         },
         body: JSON.stringify({ appId, strategy }),
       });
-      const json = await r.json();
-      if (!r.ok || json?.ok === false) throw new Error(json?.message || "Failed to fetch timeline");
+      const json = await readJsonSafe(r);
+      if (!r.ok || (json && json.ok === false)) {
+        const msg = (json && (json.message || json.error)) || `Failed to fetch timeline (HTTP ${r.status})`;
+        throw new Error(msg);
+      }
       const items: StatusRow[] = Array.isArray(json?.statuses) ? json.statuses : [];
       setStatusesByApp((prev) => ({ ...prev, [appId]: items }));
       setCachedStatuses(appId, items);
@@ -636,16 +688,23 @@ export default function FetchInfo() {
     const clean = digitsOnly(number);
 
     try {
-      const r = await fetch("/api/search/number", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      const r = await fetchWithTimeout(
+        `${API_BASE}/api/search/number`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({ number: clean, strategy: "local-first" }),
         },
-        body: JSON.stringify({ number: clean, strategy: "local-first" }),
-      });
-      const json = await r.json();
-      if (!r.ok || json?.ok === false) throw new Error(json?.message || "Search failed");
+        120000
+      );
+      const json = await readJsonSafe(r);
+      if (!r.ok || (json && json.ok === false)) {
+        const msg = (json && (json.message || json.error)) || `Search failed (HTTP ${r.status})`;
+        throw new Error(msg);
+      }
 
       // If apps are cached locally, suppress the banner (cancel delayed show)
       if (json?.cached === true) {
@@ -656,7 +715,7 @@ export default function FetchInfo() {
         setShowBanner(false);
       }
 
-      const list: AppRow[] = Array.isArray(json?.applications) ? json.applications : [];
+      const list: AppRow[] = json && Array.isArray(json.applications) ? json.applications : [];
       if (reqId !== activeReq.current) return;
 
       // Insert: determine status fetch strategy
@@ -729,7 +788,7 @@ export default function FetchInfo() {
       if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
       setShowBanner(false);
       setPhase("done");
-      setError(err?.message || "Unable to fetch info");
+      setError((err && err.message) ? `Search error: ${err.message}` : "Unable to fetch info");
       setApps([]);
     } finally {
       if (reqId === activeReq.current) setLoading(false);
@@ -1207,12 +1266,25 @@ export default function FetchInfo() {
             </button>
           </div>
           <div className="flex-1 flex items-center justify-center overflow-auto">
-            <iframe
-              ref={iframeRef}
-              src={`/api/tn-print/${encodeURIComponent(viewAppId!)}`}
-              className="w-[80%] h-[80%] max-w-full max-h-full border-none"
-              referrerPolicy="no-referrer"
-            />
+            {iframeErr ? (
+              <div className="p-4 text-sm text-rose-700 bg-rose-50 rounded-md border border-rose-200">
+                {iframeErr}.{" "}
+                <a
+                  href={viewAppId ? `${API_BASE}/api/tn-print/${encodeURIComponent(String(viewAppId))}` : '#'}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="underline font-semibold"
+                >
+                  Open in new tab
+                </a>
+              </div>
+            ) : (
+              <iframe
+                ref={iframeRef}
+                src="about:blank"
+                className="w-[80%] h-[80%] max-w-full max-h-full border-none"
+              />
+            )}
           </div>
         </div>
       </div>

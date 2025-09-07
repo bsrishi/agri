@@ -252,7 +252,7 @@ const COMMON_HEADERS = {
   "X-Requested-With": "XMLHttpRequest",
 } as const;
 
-async function tnPost(path: string, payload: any, referer: string) {
+async function tnPost(path: string, payload: any, referer: string = "/Subsidy/TrackApplication") {
   const url = `${TN_BASE}${path}`;
   if (DEBUG_TN) { console.log(`[tnPost] -> POST ${TN_BASE}${path} referer=${referer} payload=`, JSON.stringify(payload)); }
   try {
@@ -435,62 +435,126 @@ async function getStatuses(appId: string) {
   return rows as any[];
 }
 
-async function fetchAppsByNumberFromTN(number: string) {
-  if (DEBUG_TN) console.log(`[fetchAppsByNumberFromTN] input=${number}`);
-  const isAadhaar = number.length === 12;
-
-  // TN uses Aadhaar endpoint for both mobile & Aadhaar lookups, but we've seen two spellings used in production:
-  //   - get_search_application_status_by_aadhaar  (double 'a')
-  //   - get_search_application_status_by_aadhar   (single 'a')
-  // Try both in order; same referer.
-  const referer = "/Subsidy/TrackAadhar";
-  const payload = { xformVars: [{ name: "txtSearchAadhar", value: number }] };
-
+// Unified TN fetch: try the single endpoint first, then fall back to legacy endpoints
+async function tnFetchApplicationsUnified(rawNumber: string): Promise<any[]> {
+  const digits = String(rawNumber || "").replace(/\D/g, "");
   const candidates = [
-    "/HttpServiceLogin/get_search_application_status_by_aadhaar", // double 'a' (common)
-    "/HttpServiceLogin/get_search_application_status_by_aadhar",  // single 'a' (observed fallback)
+    // preferred (unified)
+    { path: "/HttpServiceLogin/get_search_application_status", body: { SearchText: digits } },
+    // fallbacks (if unified is not present in that backend build)
+    { path: "/HttpServiceLogin/get_search_application_status_by_aadhar", body: { aadhaar: digits } },
   ];
 
-  let rows: any[] = [];
-  for (const path of candidates) {
-    const inner = await tnPost(path, payload, referer);
-    const table = Array.isArray((inner as any)?.Table) ? (inner as any).Table : [];
-    if (DEBUG_TN) console.log(`[fetchAppsByNumberFromTN] tried ${path} -> ${table.length} rows`);
-    if (table.length) { rows = table; break; }
-  }
-
-  if (!rows.length) return [];
-
-  const mapped = rows.map((t: any) => ({
-    application_id: t.application_id,
-    crop_type: t.crop_type,
-    mi_name: t.mi_name,
-    applied_date: t.applied_date,
-    farmer_name: t.farmer_name,
-    mi_area: t.mi_area ?? null,
-    total_area: t.total_area ?? null,
-    survey_no: t.survey_no,
-    subdivision_no: t.subdivision_no,
-    farmer_type: t.farmer_type,
-    ss: t.ss,
-    source: "number",
-    mobile: isAadhaar ? null : number,
-    aadhaar: isAadhaar ? number : null,
-    district: null,
-    block: null,
-    village: null,
-  })) as (AppRow & { source: string })[];
-
-  // Also sync application_surveys for each mapped row
-  try {
-    for (const app of mapped) {
-      await replaceApplicationSurveys(app.application_id, app.survey_no, app.subdivision_no);
+  for (const c of candidates) {
+    try {
+      const resp = await tnPost(c.path, c.body); // uses your existing tnPost wrapper (timeout from env)
+      if (Array.isArray(resp)) return resp;
+      if (resp && Array.isArray((resp as any).result)) return (resp as any).result;
+    } catch (e: any) {
+      // Only ignore “endpoint not found / bad method” and try next candidate
+      const code = Number((e && (e.status || e.code)) || 0);
+      if (![400, 404, 405].includes(code)) throw e; // unexpected server error → bubble up
     }
+  }
+  return [];
+}
+
+async function fetchAppsByNumberFromTN(raw: string): Promise<{ apps: any[] }> {
+  const number = String(raw || "").replace(/\D/g, "");
+  const rows = await tnFetchApplicationsUnified(number);
+
+  // Normalize TN rows to our schema (adjust property names only if your TN keys differ)
+  const apps = rows.map((r: any) => ({
+    application_id: String(r.application_id || r.ApplicationID || r.app_id || "").trim(),
+    crop_type: r.crop_type ?? r.CropType ?? null,
+    mi_name: r.mi_name ?? r.CompanyName ?? r.MIName ?? null,
+    applied_date: r.applied_date ?? r.AppliedDate ?? r.application_date ?? null,
+    farmer_name: r.farmer_name ?? r.FarmerName ?? null,
+    mi_area: r.mi_area ?? r.MIArea ?? r.mi_area_ha ?? null,
+    total_area: r.total_area ?? r.TotalArea ?? r.total_area_ha ?? null,
+    survey_no: r.survey_no ?? r.SurveyNo ?? r.svy_no ?? null,
+    subdivision_no: r.subdivision_no ?? r.SubdivisionNo ?? null,
+    farmer_type: r.farmer_type ?? r.FarmerType ?? null,
+    ss: r.ss ?? r.Status ?? r.status ?? null,
+    source: "number",
+    mobile: number.length === 10 ? number : null,
+    aadhaar: number.length === 12 ? number : null,
+
+    // if you later scrape print page details, these are safe to keep
+    district: r.district ?? r.District ?? null,
+    block:    r.block    ?? r.Block    ?? null,
+    village:  r.village  ?? r.Village  ?? null,
+  })).filter((a: any) => a.application_id);
+
+  // Persist safely in a transaction to avoid FK errors on application_surveys
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    for (const a of apps) {
+      // 1) Upsert application (parent)
+      await client.query(
+        `
+        INSERT INTO applications
+          (application_id, crop_type, mi_name, applied_date, farmer_name, mi_area, total_area,
+           survey_no, subdivision_no, farmer_type, ss, source, mobile, aadhaar,
+           district, block, village)
+        VALUES
+          ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+        ON CONFLICT (application_id) DO UPDATE SET
+          crop_type = EXCLUDED.crop_type,
+          mi_name = EXCLUDED.mi_name,
+          applied_date = EXCLUDED.applied_date,
+          farmer_name = EXCLUDED.farmer_name,
+          mi_area = EXCLUDED.mi_area,
+          total_area = EXCLUDED.total_area,
+          survey_no = EXCLUDED.survey_no,
+          subdivision_no = EXCLUDED.subdivision_no,
+          farmer_type = EXCLUDED.farmer_type,
+          ss = EXCLUDED.ss,
+          source = EXCLUDED.source,
+          mobile = COALESCE(applications.mobile, EXCLUDED.mobile),
+          aadhaar = COALESCE(applications.aadhaar, EXCLUDED.aadhaar),
+          district = COALESCE(EXCLUDED.district, applications.district),
+          block    = COALESCE(EXCLUDED.block,    applications.block),
+          village  = COALESCE(EXCLUDED.village,  applications.village)
+        `,
+        [
+          a.application_id, a.crop_type, a.mi_name, a.applied_date, a.farmer_name, a.mi_area, a.total_area,
+          a.survey_no, a.subdivision_no, a.farmer_type, a.ss, a.source, a.mobile, a.aadhaar,
+          a.district ?? null, a.block ?? null, a.village ?? null,
+        ]
+      );
+
+      // 2) Insert normalized surveys AFTER the parent exists
+      const svys = Array.from(new Set(String(a.survey_no || "")
+        .split(",")
+        .map(s => s.trim())
+        .filter(Boolean)
+      ));
+      for (const sv of svys) {
+        try {
+          await client.query(
+            `INSERT INTO application_surveys (application_id, survey_no, subdivision_no)
+             VALUES ($1,$2,$3)
+             ON CONFLICT DO NOTHING`,
+            [a.application_id, sv, a.subdivision_no || null]
+          );
+        } catch (e) {
+          console.warn("[fetchAppsByNumberFromTN] survey upsert warn:", (e as any)?.message || e);
+        }
+      }
+    }
+
+    await client.query("COMMIT");
   } catch (e) {
-    console.warn("[fetchAppsByNumberFromTN] survey upsert failed:", (e as any)?.message || e);
+    await client.query("ROLLBACK");
+    throw e;
+  } finally {
+    client.release();
   }
 
-  return mapped;
+  return { apps };
 }
 // Fetch TN Print page and extract District, Block, Village, and upsert into DB
 async function fetchAndStorePrintMeta(appId: string) {
@@ -770,17 +834,9 @@ app.post("/api/search/number", async (req: Request, res: Response) => {
   try {
     console.log(`[search/number] cache-miss -> calling TNHorti`);
     tnCalled = true;
-    const mapped = await fetchAppsByNumberFromTN(normalized);
+    const { apps: mapped } = await fetchAppsByNumberFromTN(normalized);
     console.log(`[search/number] TN returned ${mapped.length} rows`);
     if (mapped.length) {
-      await upsertApplications(mapped);
-      try {
-        for (const app of mapped) {
-          await replaceApplicationSurveys(app.application_id, app.survey_no, app.subdivision_no);
-        }
-      } catch (e) {
-        console.warn("[/api/search/number] survey upsert failed:", (e as any)?.message || e);
-      }
       for (const app of mapped) {
         try { await fetchAndStoreStatuses(app.application_id); } catch (e) { console.warn("[/api/search/number] timeline fetch failed for", app.application_id, e); }
         try { await fetchAndStorePrintMeta(app.application_id); } catch {}
@@ -929,7 +985,7 @@ async function getBulkJob(jobId: string): Promise<BulkJobRow | null> {
     updated_at: r.updated_at,
     started_at: null,
     finished_at: null,
-    last_error: r.last_error ?? null,
+    last_error: null,
   } : null;
 }
 
@@ -986,7 +1042,7 @@ async function processOneNumberDB(normalized: string): Promise<{ ok: boolean; me
     return { ok: true, message: "Already available locally" };
   }
   // 2) TN
-  const mapped = await fetchAppsByNumberFromTN(normalized);
+  const { apps: mapped } = await fetchAppsByNumberFromTN(normalized);
   if (mapped.length) {
     await upsertApplications(mapped as any);
     for (const app of mapped) {
@@ -1054,7 +1110,7 @@ async function processBulkJob(jobId: string) {
       await patchBulkItem(jobId, cls.normalized, "processing", "Pulling from government sources…");
 
       // TN fetch (rate-limited by tnPost)
-      const mapped = await fetchAppsByNumberFromTN(cls.normalized);
+      const { apps: mapped } = await fetchAppsByNumberFromTN(cls.normalized);
       if (mapped.length) {
         await upsertApplications(mapped as any);
         for (const app of mapped) {
