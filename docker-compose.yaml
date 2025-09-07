@@ -1,0 +1,41 @@
+version: "3.9"
+
+services:
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    env_file:
+      - ./server/.env
+    environment:
+      - TZ=Asia/Kolkata
+      # Allow your UI origin(s)
+      - CORS_ORIGINS=https://agri.farmhost.in
+    ports:
+      - "8081:8081"         # Synology RP: agri-api.farmhost.in -> host:8081
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8081/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      args:
+        VITE_BASE: "/"
+        VITE_API_URL: "https://agri-api.farmhost.in"
+    environment:
+      - TZ=Asia/Kolkata
+    ports:
+      - "5174:3000"         # Synology RP: agri.farmhost.in -> host:5174 -> container:3000
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:3000/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
