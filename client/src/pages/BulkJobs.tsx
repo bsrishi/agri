@@ -3,14 +3,34 @@ import * as XLSX from "xlsx";
 
 // ---- API base (same pattern as Login) ----
 const API_BASE = (() => {
-  const env = (import.meta as any)?.env?.VITE_API_URL || (window as any).__API_URL__ || "";
-  return String(env || "").replace(/\/+$/, "");
+    const env = (import.meta as any)?.env?.VITE_API_URL || (window as any).__API_URL__ || "";
+    return String(env || "").replace(/\/+$/, "");
 })();
 
-/** Wrapper that prefixes API_BASE and forces JSON by default */
+/** Wrapper that prefixes API_BASE and forces JSON by default (and disables browser cache) */
 function apiFetch(path: string, init: RequestInit = {}) {
-  const url = `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}`;
-  return fetch(url, init);
+    const url = `${API_BASE}${path.startsWith("/") ? "" : "/"}${path}`;
+    const base: RequestInit = {
+        cache: "no-store",
+        headers: {
+            // callers can override/extend
+            ...(init.headers || {}),
+        },
+    };
+    return fetch(url, { ...base, ...init, headers: { ...(base.headers || {}), ...(init.headers || {}) } });
+}
+
+// Utility to get creator name from localStorage (strict reader of sla_user.name)
+function getCreatedBy(): string {
+    try {
+        const raw = localStorage.getItem("sla_user");
+        if (!raw) return "";
+        const obj = JSON.parse(raw);
+        const name = typeof obj?.name === "string" ? obj.name.trim() : "";
+        return name;
+    } catch {
+        return "";
+    }
 }
 
 
@@ -30,7 +50,7 @@ type ItemStatus = "pending" | "processing" | "ok" | "error";
 
 type ResultRow = {
     number: string;
-    kind: "mobile" | "aadhaar" | "unknown";
+    kind: "mobile" | "aadhaar" | "application" | "unknown";
     status: ItemStatus;
     message?: string;
     response?: any;
@@ -40,11 +60,17 @@ type ResultRow = {
 // - If exactly 12 digits: Aadhaar (regardless of leading digits)
 // - If exactly 10 digits: Mobile
 // - If more than 10 digits and last 10 are valid: Mobile (country/leading zero)
+// - If matches application ID pattern: application
 // - Else: invalid
-function classifyNumber(raw: string): { kind: "mobile" | "aadhaar" | "invalid"; normalized?: string } {
+function classifyAny(raw: string): { kind: "mobile" | "aadhaar" | "application" | "invalid"; normalized?: string } {
     const s = (raw || "").trim();
     const digits = s.replace(/\D/g, "");
-    if (!digits) return { kind: "invalid" };
+    if (!digits && !s) return { kind: "invalid" };
+
+    // Application ID: alphanumeric (with -), at least 8 chars, must contain at least one letter and one digit
+    if (/^[a-zA-Z0-9\-]{8,}$/.test(s) && /[a-zA-Z]/.test(s) && /\d/.test(s)) {
+        return { kind: "application", normalized: s };
+    }
 
     // 12 digits -> Aadhaar (do this FIRST to avoid stripping "91" from Aadhaar that begins with 91)
     if (digits.length === 12) {
@@ -72,13 +98,42 @@ function classifyNumber(raw: string): { kind: "mobile" | "aadhaar" | "invalid"; 
 }
 
 // Infer kind from a raw number string if backend doesn't provide it (updated logic)
-function inferKindFromDigits(num: string): "mobile" | "aadhaar" | "unknown" {
-    const d = (num || "").replace(/\D/g, "");
+function inferKindFromDigits(num: string): "mobile" | "aadhaar" | "application" | "unknown" {
+    const s = (num || "").trim();
+    const d = s.replace(/\D/g, "");
+    // Application ID: alphanumeric (with -), at least 8 chars, must contain at least one letter and one digit
+    if (/^[a-zA-Z0-9\-]{8,}$/.test(s) && /[a-zA-Z]/.test(s) && /\d/.test(s)) return "application";
     if (!d) return "unknown";
     if (d.length === 12) return "aadhaar";
     if (d.length === 10) return "mobile";
     if (d.length > 10 && /^\d{10}$/.test(d.slice(-10))) return "mobile";
     return "unknown";
+}
+
+// --- Local DB probe for Application ID statuses (no remote) ---
+async function probeAppIdLocal(appid: string, token: string | null): Promise<{ found: boolean; json?: any }> {
+    const headers: any = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    };
+    try {
+        const r = await apiFetch("/api/search/application", {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ appId: appid, strategy: "local-only" }),
+        });
+        const ct = (r.headers.get("content-type") || "").toLowerCase();
+        const json = ct.includes("application/json") ? await r.json() : null;
+        if (!r.ok) return { found: false, json };
+        // Consider it a hit if server says cached or we have any statuses/applications arrays
+        const apps = Array.isArray(json?.applications) ? json.applications : [];
+        const statuses = Array.isArray(json?.statuses) ? json.statuses : [];
+        const cached = json?.cached === true;
+        return { found: cached || apps.length > 0 || statuses.length > 0, json };
+    } catch {
+        return { found: false };
+    }
 }
 
 const formatAadhaar = (s: string) => {
@@ -166,7 +221,25 @@ function normalizeExcelCellToDigits(cell: any): string {
     return w.replace(/[^\d]/g, "");
 }
 
-const MAX_CONCURRENCY = 3;
+// Concurrency & rate limiting
+// Defaults target ~500 items/minute with a safe default concurrency.
+const DEFAULT_CONCURRENCY = 12;
+const MAX_CONCURRENCY = (() => {
+    try {
+        const fromLS = Number(localStorage.getItem("sla_bulk_concurrency") || "");
+        if (Number.isFinite(fromLS) && fromLS > 0) return Math.min(fromLS, 64);
+    } catch { }
+    return DEFAULT_CONCURRENCY;
+})();
+const DEFAULT_ITEMS_PER_MIN = 500;
+const ITEMS_PER_MIN = (() => {
+    try {
+        const fromLS = Number(localStorage.getItem("sla_bulk_ipm") || "");
+        if (Number.isFinite(fromLS) && fromLS > 0) return Math.min(fromLS, 3000);
+    } catch { }
+    return DEFAULT_ITEMS_PER_MIN;
+})();
+const MIN_GAP_MS = Math.max(0, Math.floor(60000 / ITEMS_PER_MIN)); // min ms between request starts
 
 const BulkJobs: React.FC = () => {
     const [file, setFile] = useState<File | null>(null);
@@ -174,7 +247,6 @@ const BulkJobs: React.FC = () => {
     const [activeSheet, setActiveSheet] = useState<string | null>(null);
     const [columns, setColumns] = useState<string[]>([]);
     const [selectedCol, setSelectedCol] = useState<string | null>(null);
-    const [columnName, setColumnName] = useState<string>("");
     const [preview, setPreview] = useState<any[][]>([]);
 
     const [rows, setRows] = useState<ResultRow[]>([]);
@@ -185,9 +257,41 @@ const BulkJobs: React.FC = () => {
     const [progress, setProgress] = useState({ total: 0, done: 0, ok: 0, error: 0 });
     const [startedAt, setStartedAt] = useState<number | null>(null);
     const abortRef = useRef<boolean>(false);
+    const lastLaunchRef = useRef<number>(0);
+    const lastServerActionRef = useRef<null | 'cancel' | 'delete'>(null);
     // --- Server mode additions ---
     const [serverMode, setServerMode] = useState(true);
     const [jobId, setJobId] = useState<string | null>(null);
+    const LS_JOB_KEY = "sla_bulk_last_job";
+    const LS_PROGRESS_KEY = "sla_bulk_last_progress";
+    const [createdBy, setCreatedBy] = useState<string>("");
+
+    function saveSnapshot(
+        id: string | null,
+        prog: { total: number; done: number; ok: number; error: number },
+        rowsSnap: ResultRow[]
+      ) {
+        try {
+          if (!id) return;
+          const snap = { jobId: id, progress: prog, rows: rowsSnap, ts: Date.now() };
+          localStorage.setItem(LS_PROGRESS_KEY, JSON.stringify(snap));
+        } catch {}
+      }
+      
+      function tryRestoreSnapshot(id: string | null) {
+        try {
+          if (!id) return false;
+          const raw = localStorage.getItem(LS_PROGRESS_KEY);
+          if (!raw) return false;
+          const snap = JSON.parse(raw);
+          if (!snap || snap.jobId !== id) return false;
+          if (snap.progress) setProgress(snap.progress);
+          if (Array.isArray(snap.rows)) setRows(snap.rows);
+          return true;
+        } catch {
+          return false;
+        }
+      }
 
     // --- helpers ---
     function resetAll() {
@@ -250,15 +354,8 @@ const BulkJobs: React.FC = () => {
 
     // Reads numbers from the selected column (entire sheet, robust against Excel formatting/scientific notation)
     const extractedNumbers = useMemo(() => {
-        if (!file || (!selectedCol && !columnName) || !columns.length) return [] as Promise<string[]>;
-        let colIdx = -1;
-        if (columnName) {
-            const want = columnName.trim().toLowerCase();
-            colIdx = columns.findIndex(c => c.trim().toLowerCase() === want);
-        }
-        if (colIdx < 0 && selectedCol) {
-            colIdx = columns.indexOf(selectedCol);
-        }
+        if (!file || !selectedCol || !columns.length) return [] as Promise<string[]>;
+        let colIdx = columns.indexOf(selectedCol);
         if (colIdx < 0) return [] as Promise<string[]>;
 
         return (async () => {
@@ -301,7 +398,7 @@ const BulkJobs: React.FC = () => {
                         originalStr = sciStrToPlainDigits(originalStr);
                     }
 
-                    const cls = classifyNumber(originalStr);
+                    const cls = classifyAny(originalStr);
                     if (cls.kind !== "invalid" && cls.normalized) {
                         values.push(cls.normalized);
                     }
@@ -320,7 +417,7 @@ const BulkJobs: React.FC = () => {
                 return [] as string[];
             }
         })();
-    }, [file, activeSheet, selectedCol, columns, columnName]);
+    }, [file, activeSheet, selectedCol, columns]);
 
     const [numbers, setNumbers] = useState<string[]>([]);
     useEffect(() => {
@@ -336,7 +433,7 @@ const BulkJobs: React.FC = () => {
 
     useEffect(() => {
         const seed: ResultRow[] = numbers.map((n) => {
-            const cls = classifyNumber(n);
+            const cls = classifyAny(n);
             return {
                 number: cls.normalized || n,
                 kind: cls.kind === "invalid" ? "unknown" : cls.kind,
@@ -347,30 +444,175 @@ const BulkJobs: React.FC = () => {
         setProgress({ total: seed.length, done: 0, ok: 0, error: 0 });
     }, [numbers]);
 
-    // Memoized detected counts for the Detected numbers card
+    // Memoized detected counts for the Detected items card
     const detectedCounts = useMemo(() => {
-        let mobile = 0, aadhaar = 0, unknown = 0;
+        let mobile = 0, aadhaar = 0, application = 0, unknown = 0;
         for (const n of numbers) {
-            const { kind } = classifyNumber(n);
+            const { kind } = classifyAny(n);
             if (kind === "mobile") mobile++;
             else if (kind === "aadhaar") aadhaar++;
+            else if (kind === "application") application++;
             else unknown++;
         }
-        return { mobile, aadhaar, unknown };
+        return { mobile, aadhaar, application, unknown };
     }, [numbers]);
+
+    // Robust AppID search: try multiple payload shapes/endpoints to accommodate backend variations
+    async function fetchAppIdWithFallbacks(appid: string, token: string | null): Promise<Response> {
+        const commonHeaders: any = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        };
+        const attempts: Array<{ method?: string; path: string; body?: any }> = [
+            // Prefer the unified application endpoint; let backend do DB-first using strategy
+            { path: "/api/search/application", body: { appId: appid, strategy: "local-first" } },
+            { path: "/api/search/application", body: { application_id: appid, strategy: "local-first" } },
+            { path: "/api/search/application", body: { applicationId: appid, strategy: "local-first" } },
+            { path: "/api/search/application", body: { id: appid, strategy: "local-first" } },
+            // As a last resort, allow GET with strategy=local-first so backend can still prefer cache DB
+            { method: "GET", path: `/api/search/application?appId=${encodeURIComponent(appid)}&strategy=local-first` },
+        ];
+        let lastErrText = "";
+        for (const a of attempts) {
+            try {
+                const init: RequestInit = {
+                    method: a.method || "POST",
+                    headers: commonHeaders,
+                };
+                if (!a.method || a.method === "POST") {
+                    init.body = JSON.stringify(a.body ?? {});
+                }
+                const r = await apiFetch(a.path, { cache: "no-store", ...init });
+                // Prefer JSON responses and HTTP 2xx
+                const ok = r.ok;
+                const ct = (r.headers.get("content-type") || "").toLowerCase();
+                if (ok && ct.includes("application/json")) return r;
+                // If backend responded non-JSON 2xx, still return it (caller will handle)
+                if (ok) return r;
+                // For 4xx, keep trying next variants
+                if (r.status >= 400 && r.status < 500) {
+                    try { lastErrText = await r.text(); } catch { /* ignore */ }
+                    continue;
+                }
+                // For 5xx or network-like, break and return immediately
+                return r;
+            } catch (e: any) {
+                lastErrText = e?.message || String(e);
+                continue;
+            }
+        }
+        // Construct a synthetic 400-like Response to surface diagnostic
+        return new Response(JSON.stringify({ ok: false, message: lastErrText || "All AppID payload variants failed" }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" }
+        });
+    }
+
+    // Try to start a server job for Application IDs so they persist in /jobs and survive refresh
+    async function tryStartServerJobForApplications(appIds: string[]): Promise<{ ok: boolean; jobId?: string; message?: string }> {
+        if (!appIds?.length) return { ok: false, message: "No Application IDs provided" };
+        const token = localStorage.getItem("sla_token");
+        const headers: any = { "Accept": "application/json", "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) };
+        const created_by = getCreatedBy();
+        const attempts: Array<{ path: string; body: any }> = [
+            // Common variants backends might accept
+            { path: "/api/bulk/start", body: { appids: appIds, created_by } },
+            { path: "/api/bulk/start", body: { application_ids: appIds, created_by } },
+            { path: "/api/bulk/start", body: { applicationIds: appIds, created_by } },
+            { path: "/api/bulk/start", body: { ids: appIds, type: "application", created_by } },
+            { path: "/api/bulk/start", body: { items: appIds.map(v => ({ kind: "application", value: v })), created_by } },
+            // Some deployments expose an explicit appid endpoint
+            { path: "/api/bulk/start-appid", body: { appids: appIds, created_by } },
+        ];
+        let lastErr = "";
+        for (const a of attempts) {
+            try {
+                const r = await apiFetch(a.path, { method: "POST", headers, body: JSON.stringify(a.body) });
+                const ct = (r.headers.get("content-type") || "").toLowerCase();
+                if (!ct.includes("application/json")) {
+                    if (r.ok) return { ok: false, message: `Non-JSON response (status ${r.status})` };
+                    continue;
+                }
+                const json = await r.json();
+                if (r.ok && json && json.ok !== false) {
+                    const id = json.jobId || json.id || json.job?.id;
+                    if (id) return { ok: true, jobId: String(id) };
+                }
+                lastErr = json?.message || `HTTP ${r.status}`;
+                // For 4xx, try next variant
+                if (r.status >= 400 && r.status < 500) continue;
+                // For 5xx, bail out early
+                break;
+            } catch (e: any) {
+                lastErr = e?.message || String(e);
+                continue;
+            }
+        }
+        return { ok: false, message: lastErr || "All variants failed for starting Application ID job" };
+    }
+
+    // Try to start a server job for numbers/aadhaar with multiple payload variants
+    async function tryStartServerJobForNumbers(rowsIn: ResultRow[]): Promise<{ ok: boolean; jobId?: string; message?: string }> {
+        if (!rowsIn?.length) return { ok: false, message: "No items" };
+        const token = localStorage.getItem("sla_token");
+        const headers: any = { "Accept": "application/json", "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) };
+        const created_by = getCreatedBy();
+        const numbersOnly = rowsIn.map(r => r.number);
+        const itemsTyped = rowsIn.map(r => ({ kind: r.kind, value: r.number }));
+        const attempts: Array<{ path: string; body: any }> = [
+            { path: "/api/bulk/start", body: { numbers: numbersOnly, created_by } },
+            { path: "/api/bulk/start", body: { items: itemsTyped, created_by } },
+            { path: "/api/bulk/start", body: { mobiles: numbersOnly, created_by } },
+            { path: "/api/bulk/start", body: { values: numbersOnly, created_by } },
+            { path: "/api/bulk/start-number", body: { numbers: numbersOnly, created_by } },
+            { path: "/api/bulk/start-number", body: { items: itemsTyped, created_by } },
+        ];
+        let lastErr = "";
+        for (const a of attempts) {
+            try {
+                const r = await apiFetch(a.path, { method: "POST", headers, body: JSON.stringify(a.body) });
+                const ct = (r.headers.get("content-type") || "").toLowerCase();
+                let json: any = null;
+                if (ct.includes("application/json")) {
+                    json = await r.json();
+                } else {
+                    // Non-JSON 2xx: treat as ambiguous failure with diagnostic text
+                    if (r.ok) return { ok: false, message: `Non-JSON response (status ${r.status})` };
+                    const t = await r.text().catch(() => "");
+                    lastErr = t || `HTTP ${r.status}`;
+                    if (r.status >= 500) break; // don't keep trying on 5xx
+                    continue; // try next variant for 4xx
+                }
+                if (r.ok && json && json.ok !== false) {
+                    const id = json.jobId || json.id || json.job?.id;
+                    if (id) return { ok: true, jobId: String(id) };
+                    lastErr = json?.message || lastErr || "Missing jobId in response";
+                    continue;
+                }
+                lastErr = json?.message || `HTTP ${r.status}`;
+                if (r.status >= 500) break; // bail on server error
+            } catch (e: any) {
+                lastErr = e?.message || String(e);
+                continue;
+            }
+        }
+        return { ok: false, message: lastErr || "All variants failed for starting numbers job" };
+    }
 
     // --- Processing ---
     // The original runProcessing is now renamed to runProcessingClient
+    // Helper for sleeping
+    function sleep(ms: number) {
+        return new Promise<void>(resolve => setTimeout(resolve, ms));
+    }
     async function runProcessingClient() {
         if (!rows.length) return;
         setProcessing(true);
         setStartedAt(Date.now());
         abortRef.current = false;
 
-        // Work queue with limited concurrency
-        let done = 0;
-        let ok = 0;
-        let err = 0;
+        // Progress is tracked via functional updates to avoid race conditions
 
         const queue = [...rows];
         const next = async () => {
@@ -380,66 +622,113 @@ const BulkJobs: React.FC = () => {
 
             updateRow(item.number, { status: "processing", message: "Checking local cache…" });
 
+            let succeeded = false;
             try {
-                const clsForSend = classifyNumber(item.number);
+                const clsForSend = classifyAny(item.number);
                 if (clsForSend.kind === "invalid" || !clsForSend.normalized) {
-                    updateRow(item.number, { status: "error", message: "Invalid number format" });
-                    done++; setProgress((p) => ({ ...p, done, error: ++err }));
+                    updateRow(item.number, { status: "error", message: "Invalid item format" });
+                    // Progress update below in finally
                     if (queue.length) await next();
                     return;
                 }
-                const searchNumber = clsForSend.normalized;
+                const searchValue = clsForSend.normalized;
                 const token = localStorage.getItem("sla_token");
-                const r = await apiFetch("/api/search/number", {
-                    method: "POST",
-                    headers: {
-                        "Content-Type": "application/json",
-                        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-                    },
-                    body: JSON.stringify({ number: searchNumber }),
-                });
-
-                const json = await r.json().catch(() => ({}));
-                if (r.ok && json && json.ok !== false) {
-                    ok++;
-                    let msg = "";
-                    const apps = Array.isArray(json.applications) ? json.applications : [];
-                    if (apps.length === 0) {
-                        msg = "No applications found – Farmer hasn’t used the services";
-                    } else if (json.cached === true) {
-                        msg = "Already available locally";
-                    } else if (apps.length > 0) {
-                        msg = "Fetched from government sources";
+                let r: Response;
+                if (clsForSend.kind === "application") {
+                    // First: strict local probe so Bulk doesn't re-hit remote when DB already has timelines (same behavior as FetchInfo)
+                    const localProbe = await probeAppIdLocal(searchValue, token);
+                    if (localProbe.found) {
+                        updateRow(item.number, {
+                            status: "ok",
+                            message: "Already available locally",
+                            response: localProbe.json || { cached: true, applicationId: searchValue }
+                        });
+                        succeeded = true;
+                    } else {
+                        // Now call unified /api/search/application with strategy=local-first (see fetchAppIdWithFallbacks)
+                        // No local data — proceed with the flexible/remote-capable fallbacks
+                        if (MIN_GAP_MS > 0) {
+                            const now = Date.now();
+                            const elapsed = now - (lastLaunchRef.current || 0);
+                            if (elapsed < MIN_GAP_MS) {
+                                await sleep(MIN_GAP_MS - elapsed);
+                            }
+                            lastLaunchRef.current = Date.now();
+                        }
+                        r = await fetchAppIdWithFallbacks(searchValue, token);
                     }
-
-                    // Detect any merge/link signals from backend to inform the user
-                    const linkType = (json.linked?.type || json.linkAction || "").toString().toLowerCase();
-                    const merged =
-                        Boolean(json.merged) ||
-                        Boolean(json.linked) ||
-                        linkType === "aadhaar" ||
-                        linkType === "mobile" ||
-                        (typeof json.linked?.action === "string" && json.linked.action.toLowerCase() === "link") ||
-                        (typeof json.action === "string" && json.action.toLowerCase() === "link");
-
-                    if (merged) {
-                        msg += " • Merged with existing data";
-                        // (Optional: keep the specific detail)
-                        if (linkType === "aadhaar") msg += " (Aadhaar)";
-                        if (linkType === "mobile") msg += " (Mobile)";
-                    }
-
-                    updateRow(item.number, { status: "ok", message: msg, response: json });
                 } else {
-                    err++;
-                    updateRow(item.number, { status: "error", message: json?.message || `HTTP ${r.status}` });
+                    // Simple rate limiter: ensure a minimum gap between request starts
+                    if (MIN_GAP_MS > 0) {
+                        const now = Date.now();
+                        const elapsed = now - (lastLaunchRef.current || 0);
+                        if (elapsed < MIN_GAP_MS) {
+                            await sleep(MIN_GAP_MS - elapsed);
+                        }
+                        lastLaunchRef.current = Date.now();
+                    }
+                    r = await apiFetch("/api/search/number", {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                        },
+                        body: JSON.stringify({ number: searchValue, strategy: "local-first" }),
+                    });
+                }
+
+                if (r) {
+                    const json = await r.json().catch(() => ({}));
+                    if (r && r.ok && json && json.ok !== false) {
+                        let msg = "";
+                        const apps = Array.isArray(json.applications) ? json.applications : [];
+                        const statuses = Array.isArray(json.statuses) ? json.statuses : [];
+                        const cached = json.cached === true;
+                        if (apps.length === 0 && statuses.length === 0) {
+                            msg = "No applications found – Farmer hasn’t used the services";
+                        } else if (cached) {
+                            msg = "Already available locally";
+                        } else {
+                            msg = "Fetched from government sources";
+                        }
+
+                        // Detect any merge/link signals from backend to inform the user
+                        const linkType = (json.linked?.type || json.linkAction || "").toString().toLowerCase();
+                        const merged =
+                            Boolean(json.merged) ||
+                            Boolean(json.linked) ||
+                            linkType === "aadhaar" ||
+                            linkType === "mobile" ||
+                            (typeof json.linked?.action === "string" && json.linked.action.toLowerCase() === "link") ||
+                            (typeof json.action === "string" && json.action.toLowerCase() === "link");
+
+                        if (merged) {
+                            msg += " • Merged with existing data";
+                            // (Optional: keep the specific detail)
+                            if (linkType === "aadhaar") msg += " (Aadhaar)";
+                            if (linkType === "mobile") msg += " (Mobile)";
+                        }
+
+                        updateRow(item.number, { status: "ok", message: msg, response: json });
+                        succeeded = true;
+                    } else {
+                        let msg = json?.message || "";
+                        if (!msg) {
+                            try { msg = await r.text(); } catch { /* ignore */ }
+                        }
+                        updateRow(item.number, { status: "error", message: msg || `HTTP ${r.status}` });
+                    }
                 }
             } catch (e: any) {
-                err++;
                 updateRow(item.number, { status: "error", message: e?.message || "Network error" });
             } finally {
-                done++;
-                setProgress((p) => ({ ...p, done, ok, error: err }));
+                // Always increment done; adjust ok/error based on success flag using functional updates
+                setProgress((p) => ({
+                    ...p,
+                    done: Math.min(p.done + 1, p.total),
+                    ok: p.ok + (succeeded ? 1 : 0),
+                    error: p.error + (succeeded ? 0 : 1),
+                }));
                 if (queue.length) await next();
             }
         };
@@ -452,6 +741,42 @@ const BulkJobs: React.FC = () => {
 
     // New wrapper for processing, chooses server or client
     async function runProcessing() {
+        // If we have Application IDs and serverMode is enabled, try to persist them as a server job first
+        if (serverMode) {
+            const appIdRows = rows.filter(r => r.kind === "application").map(r => r.number);
+            if (appIdRows.length) {
+                // Seed progress if empty so UI doesn't flash
+                if (progress.total === 0) setProgress({ total: rows.length, done: 0, ok: 0, error: 0 });
+                const started = await tryStartServerJobForApplications(appIdRows);
+                if (started.ok && started.jobId) {
+                    setJobId(started.jobId);
+                    localStorage.setItem(LS_JOB_KEY, started.jobId);
+                    const seededRows = rows.map(rr =>
+                      rr.kind === "application" ? { ...rr, status: "processing", message: "Queued on server…" } : rr
+                    );
+                    setRows(seededRows);
+                    saveSnapshot(started.jobId, { total: rows.length, done: 0, ok: 0, error: 0 }, seededRows);
+                    setProcessing(true);
+                    setStartedAt(Date.now());
+                    return;
+                  }
+                // If starting server job failed, we will fall back to client mode for Application IDs below
+            }
+        }
+        // If any Application IDs are present, we attempted a server job above.
+        // If that failed (no jobId set), we'll fall back to client mode below.
+        const containsApplicationIds =
+            rows.some(r => r.kind === "application") ||
+            rows.some(r => {
+                const s = (r.number || "").trim();
+                return /^[A-Za-z0-9\-]{8,}$/.test(s) && /[A-Za-z]/.test(s) && /\d/.test(s);
+            });
+
+        if (serverMode && containsApplicationIds) {
+            // Run locally to preserve alphanumerics and dashes for Application IDs
+            await runProcessingClient();
+            return;
+        }
         if (processing) return;
         if (serverMode) {
             if (!rows.length) return;
@@ -459,31 +784,19 @@ const BulkJobs: React.FC = () => {
             setStartedAt(Date.now());
             setProgress({ total: rows.length, done: 0, ok: 0, error: 0 }); // Seed progress to avoid flash
             try {
-                const nums = rows.map(r => r.number);
-                const token = localStorage.getItem("sla_token");
-                const r = await apiFetch("/api/bulk/start", {
-                    method: "POST",
-                    headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
-                    body: JSON.stringify({ numbers: nums })
-                });
-
-                const ct = (r.headers.get("content-type") || "").toLowerCase();
-                let json: any = null;
-                if (ct.includes("application/json")) {
-                    json = await r.json();
-                } else {
-                    const text = await r.text();
-                    throw new Error(`Non-JSON response from /api/bulk/start (status ${r.status}).\nThis often means a proxy/route issue or an auth redirect returned HTML.\nFirst 200 chars: ${text.slice(0, 200)}`);
-                }
-
-                if (!r.ok || json?.ok === false) throw new Error(json?.message || `HTTP ${r.status}`);
-                const id = json.jobId as string;
+                const res = await tryStartServerJobForNumbers(rows);
+                if (!res.ok || !res.jobId) throw new Error(res.message || "Failed to start server job");
+                const id = res.jobId;
                 setJobId(id);
-                localStorage.setItem("sla_bulk_last_job", id);
-                setRows(rows.map(r => ({ ...r, status: "processing", message: "Queued on server…" })));
+                localStorage.setItem(LS_JOB_KEY, id);
+                const seededRows = rows.map(r => ({ ...r, status: "processing", message: "Queued on server…" }));
+                setRows(seededRows);
+                saveSnapshot(id, { total: rows.length, done: 0, ok: 0, error: 0 }, seededRows);
             } catch (e: any) {
-                setParseError(e?.message || "Failed to start server job.");
-                setProcessing(false);
+                // Fall back to client mode automatically on 4xx/format issues
+                setParseError(undefined as any);
+                await runProcessingClient();
+                return;
             }
             return;
         }
@@ -497,7 +810,29 @@ const BulkJobs: React.FC = () => {
         );
     }
 
-    function cancel() {
+    async function cancel() {
+        // If a server-side job is running, cancel it at the backend (and purge)
+        if (jobId) {
+            const yes = window.confirm("Cancel this server job and delete records created so far?");
+            if (!yes) return;
+            const res = await cancelServerJob(jobId);
+            if (!res.ok) {
+                setParseError(res.message || "Failed to cancel server job.");
+                return;
+            }
+            // Mark last action, clear persisted job pointers, stop viewing, and refresh list
+            lastServerActionRef.current = 'cancel';
+            try { localStorage.removeItem(LS_JOB_KEY); } catch {}
+            try { localStorage.removeItem(LS_PROGRESS_KEY); } catch {}
+            // Clear ALL Excel parsing fields/state
+            setFile(null);
+            setNumbers([]);
+            resetAll();
+            handleHideView();
+            setRecentJobs(await fetchRecentServerJobs(2));
+            return;
+        }
+        // Otherwise, this is a purely local run — just abort the client workers
         abortRef.current = true;
         setProcessing(false);
     }
@@ -538,14 +873,18 @@ const BulkJobs: React.FC = () => {
     }
 
     // --- UI helpers ---
-    const pct = progress.total ? Math.round((progress.done / progress.total) * 100) : 0;
+    const completedCount = useMemo(
+        () => Math.min(progress.ok + progress.error, progress.total),
+        [progress.ok, progress.error, progress.total]
+    );
+    const pct = progress.total ? Math.round((completedCount / progress.total) * 100) : 0;
     const eta = useMemo(() => {
-        if (!startedAt || progress.done === 0) return null;
+        if (!startedAt || completedCount === 0) return null;
         const elapsed = Date.now() - startedAt; // ms
-        const perItem = elapsed / progress.done;
-        const remaining = (progress.total - progress.done) * perItem;
+        const perItem = elapsed / completedCount;
+        const remaining = (progress.total - completedCount) * perItem;
         return msToNice(remaining);
-    }, [startedAt, progress.done, progress.total]);
+    }, [startedAt, completedCount, progress.total]);
 
     function msToNice(ms: number) {
         const s = Math.round(ms / 1000);
@@ -609,38 +948,40 @@ const BulkJobs: React.FC = () => {
     useEffect(() => {
         if (file) return; // working locally — don't auto-resume a server job
         (async () => {
-            const last = localStorage.getItem("sla_bulk_last_job");
-            if (last) {
-                setJobId(last);
-                setProcessing(true);
-                setRows([]);
-                setProgress({ total: 0, done: 0, ok: 0, error: 0 });
+          const last = localStorage.getItem(LS_JOB_KEY);
+          if (last) {
+            setJobId(last);
+            setProcessing(true);
+            tryRestoreSnapshot(last);
+            if (!createdBy) {
+              const n = getCreatedBy();
+              if (n) setCreatedBy(n);
             }
-            const latest = await fetchLatestServerJobId();
-            if (latest && latest !== last) {
-                setJobId(latest);
-                setProcessing(true);
-                setRows([]);
-                setProgress({ total: 0, done: 0, ok: 0, error: 0 });
-                localStorage.setItem("sla_bulk_last_job", latest);
+          }
+          const latest = await fetchLatestServerJobId();
+          if (latest && latest !== last) {
+            setJobId(latest);
+            setProcessing(true);
+            tryRestoreSnapshot(latest);
+            localStorage.setItem(LS_JOB_KEY, latest);
+            if (!createdBy) {
+              const n = getCreatedBy();
+              if (n) setCreatedBy(n);
             }
+          }
         })();
-    }, [file]);
+      }, [file]);
 
     // --- Server job polling ---
-    // Map backend job-item state to our UI ItemStatus
+    // Map backend job-item state to our UI ItemStatus, robustly normalizing synonyms and considering state_text.
     function mapStateToStatus(it: any): ItemStatus {
-        const state = (it.state ?? it.status ?? "").toString().toLowerCase();
-        // Some backends may include a boolean/flag for success or error
-        const errLike = Boolean(it.error) || String(it.result || "").toLowerCase() === "error";
-        if (state === "queued" || state === "running" || state === "processing") return "processing";
-        if (state === "pending") return "pending";
-        if (state === "done" || state === "completed" || state === "ok" || state === "success") {
-            return errLike ? "error" : "ok";
-        }
-        if (state === "error" || state === "failed" || state === "fail") return "error";
-        // Fallback: if we have an HTTP ok prior, treat as processing until completed
-        return "processing";
+      const raw = String((it?.status ?? it?.state ?? it?.state_text ?? "")).toLowerCase().trim();
+      // Normalize a few common synonyms
+      if (["ok", "success", "completed", "done", "complete"].includes(raw)) return "ok";
+      if (["error", "failed", "fail", "failure"].includes(raw)) return "error";
+      if (["processing", "running", "pending", "queued", "queue", "in_progress"].includes(raw)) return "processing";
+      // Default to processing while backend works
+      return "processing";
     }
 
     // Extracted pollOnce for one-off status polling
@@ -657,13 +998,20 @@ const BulkJobs: React.FC = () => {
             const ct = (r.headers.get("content-type") || "").toLowerCase();
             let json: any = null;
             if (ct.includes("application/json")) {
-                json = await r.json();
+              json = await r.json();
             } else {
-                const text = await r.text();
-                throw new Error(`Non-JSON response from /api/bulk/${jobId}/status (status ${r.status}).\nLikely a proxy/route miss or auth redirect returned HTML.\nFirst 200 chars: ${text.slice(0, 200)}`);
+              const text = await r.text();
+              const first = (text || "").slice(0, 200);
+              setParseError(`Non-JSON response from /api/bulk/${jobId}/status (status ${r.status}).\nLikely a proxy/route miss or auth redirect returned HTML.\nFirst 200 chars: ${first}`);
+              setProcessing(false);
+              return; // stop polling gracefully
             }
             if (r.ok && json?.ok) {
                 const job = json.job || {};
+                const fromServerCreator = String(job.created_by || job.createdBy || "").trim();
+                if (fromServerCreator && fromServerCreator !== createdBy) {
+                    setCreatedBy(fromServerCreator);
+                }
                 const items = Array.isArray(json.items) ? json.items : [];
 
                 // Update top-level counters if present; otherwise derive them
@@ -671,55 +1019,70 @@ const BulkJobs: React.FC = () => {
                 let done = Number(job.done ?? 0) || 0;
                 let ok = Number(job.ok ?? 0) || 0;
                 let error = Number(job.error ?? 0) || 0;
-
                 if (job.done == null) {
-                    // derive from items if counters not provided
-                    const counts = items.reduce((acc: any, it: any) => {
-                        const s = mapStateToStatus(it);
-                        if (s === "ok" || s === "error" || s === "pending" || s === "processing") acc[s]++;
-                        return acc;
-                    }, { ok: 0, error: 0, pending: 0, processing: 0 });
-                    ok = counts.ok;
-                    error = counts.error;
-                    done = ok + error;
+                  const counts = items.reduce((acc: any, it: any) => {
+                    const s = mapStateToStatus(it);
+                    if (s === "ok" || s === "error") acc.done++;
+                    if (s === "ok") acc.ok++;
+                    if (s === "error") acc.error++;
+                    return acc;
+                  }, { done: 0, ok: 0, error: 0 });
+                  done = counts.done; ok = counts.ok; error = counts.error;
                 }
+                const newProg = { total, done, ok, error };
 
-                setProgress(prev => ({
-                    total: total || prev.total,
-                    done,
-                    ok,
-                    error
-                }));
-
-                // Map items to our UI rows
+                // Map items to our UI rows with improved message logic
                 const mapped: ResultRow[] = items.map((it: any) => {
-                    const num = String(it.number ?? it.input ?? "");
-                    const backendKind = (it.kind || "").toString().toLowerCase();
-                    const kind: "mobile" | "aadhaar" | "unknown" =
-                        backendKind === "mobile" || backendKind === "aadhaar"
-                            ? (backendKind as any)
-                            : inferKindFromDigits(num);
-                    return {
-                        number: num,
-                        kind,
-                        status: mapStateToStatus(it),
-                        message: it.message || it.last_message || it.detail || ""
-                    };
+                  const num = String(it.number ?? it.input ?? "");
+                  const backendKind = (it.kind || "").toString().toLowerCase();
+                  const inferred = inferKindFromDigits(num);
+                  const kind: "mobile" | "aadhaar" | "application" | "unknown" =
+                    backendKind === "mobile" || backendKind === "aadhaar" || backendKind === "application"
+                      ? (backendKind as any)
+                      : inferred;
+                  const st = mapStateToStatus(it);
+                  let msg = it.message || it.last_message || it.detail || "";
+                  if (!msg) {
+                    if (st === "ok") msg = "Completed";
+                    else if (st === "error") msg = "Failed";
+                    else if (st === "processing") msg = "Processing on server…";
+                  }
+                  return { number: num, kind, status: st, message: msg };
                 });
-
-                // Only update rows if items is non-empty
+                let rowsToSet: ResultRow[];
                 if (items.length > 0) {
-                    setRows(mapped.slice().reverse());
+                  rowsToSet = mapped.slice().reverse();
+                } else {
+                  const statusText = String(job.status || "queued").toLowerCase();
+                  const msg = statusText === "running" ? "Processing on server…" : statusText === "queued" ? "Queued on server…" : `Job ${statusText}`;
+                  rowsToSet = (rows && rows.length > 0)
+                    ? rows.map(r => ({ ...r, status: "processing", message: msg }))
+                    : [{
+                        number: String(job.id || jobId || "job"),
+                        kind: "unknown",
+                        status: mapStateToStatus({ status: job.status, error: (Number(error)||0) > 0 }),
+                        message: `Job ${statusText} • OK: ${ok} • Err: ${error}`.trim()
+                      }];
                 }
+                setProgress(newProg);
+                setRows(rowsToSet);
+                saveSnapshot(jobId, newProg, rowsToSet);
 
                 const jStatus = String(job.status || "").toLowerCase();
                 if (["done", "completed", "canceled", "error", "failed"].includes(jStatus)) {
                     setProcessing(false);
                 }
             } else {
-                // Treat missing/404 as terminal unless transient
                 if (r.status === 404) {
-                    // Quietly stop viewing; job likely expired/cleaned up
+                    // If we just canceled/deleted, a 404 is expected; suppress error and stop viewing.
+                    if (lastServerActionRef.current === 'cancel' || lastServerActionRef.current === 'delete') {
+                        setRows([]);
+                        setProcessing(false);
+                        lastServerActionRef.current = null; // clear the flag
+                        return;
+                    }
+                    // Otherwise, surface a soft message and stop viewing
+                    setParseError('Job not found on server (404). It may have expired.');
                     setRows([]);
                     setProcessing(false);
                     return;
@@ -742,7 +1105,7 @@ const BulkJobs: React.FC = () => {
     }, [jobId]);
 
     // --- Server Jobs (recent) additions ---
-    type RecentJob = { id: string; status?: string; created_at?: string; total?: number; done?: number; ok?: number; error?: number; };
+    type RecentJob = { id: string; status?: string; created_at?: string; created_by?: string; total?: number; done?: number; ok?: number; error?: number; };
 
     const [recentJobs, setRecentJobs] = useState<RecentJob[]>([]);
     const [loadingRecent, setLoadingRecent] = useState(false);
@@ -762,7 +1125,7 @@ const BulkJobs: React.FC = () => {
         try {
             const token = localStorage.getItem("sla_token");
             // Preferred endpoint
-        let r = await apiFetch(`/api/bulk/recent?days=${days}`, {
+            let r = await apiFetch(`/api/bulk/recent?days=${days}`, {
                 headers: { "Accept": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) }
             });
             if (r.ok && (r.headers.get("content-type") || "").toLowerCase().includes("application/json")) {
@@ -772,6 +1135,7 @@ const BulkJobs: React.FC = () => {
                     id: String(it.id ?? it.job_id ?? it.jobId ?? ""),
                     status: it.status ?? "",
                     created_at: it.created_at ?? it.started_at ?? it.createdAt ?? it.created ?? "",
+                    created_by: it.created_by ?? it.createdBy ?? "",
                     total: Number(it.total ?? 0) || 0,
                     done: Number(it.done ?? 0) || 0,
                     ok: Number(it.ok ?? 0) || 0,
@@ -815,13 +1179,20 @@ const BulkJobs: React.FC = () => {
             const ct = (r.headers.get("content-type") || "").toLowerCase();
             let json: any = null;
             if (ct.includes("application/json")) {
-                json = await r.json();
+              json = await r.json();
             } else {
-                const text = await r.text();
-                throw new Error(`Non-JSON response from /api/bulk/${id}/status (status ${r.status}).\nLikely a proxy/route miss or auth redirect returned HTML.\nFirst 200 chars: ${text.slice(0, 200)}`);
+              const text = await r.text();
+              const first = (text || "").slice(0, 200);
+              setParseError(`Non-JSON response from /api/bulk/${id}/status (status ${r.status}).\nLikely a proxy/route miss or auth redirect returned HTML.\nFirst 200 chars: ${first}`);
+              setProcessing(false);
+              return; // abort this one-off poll gracefully
             }
             if (r.ok && json?.ok) {
                 const job = json.job || {};
+                const fromServerCreator = String(job.created_by || job.createdBy || "").trim();
+                if (fromServerCreator && fromServerCreator !== createdBy) {
+                    setCreatedBy(fromServerCreator);
+                }
                 const items = Array.isArray(json.items) ? json.items : [];
 
                 // Update top-level counters if present; otherwise derive them
@@ -842,32 +1213,54 @@ const BulkJobs: React.FC = () => {
                     done = ok + error;
                 }
 
-                setProgress(prev => ({
-                    total: total || prev.total,
-                    done,
-                    ok,
-                    error
-                }));
+                setProgress(prev => {
+                    const newTotal = Math.max(prev.total, Number(total) || 0);
+                    const newDone = Math.max(prev.done, Number(done) || 0);
+                    const newOk = Math.max(prev.ok, Number(ok) || 0);
+                    const newErr = Math.max(prev.error, Number(error) || 0);
+                    return { total: newTotal, done: newDone, ok: newOk, error: newErr };
+                });
 
-                // Map items to our UI rows
+                // Map items to our UI rows with improved message logic
                 const mapped: ResultRow[] = items.map((it: any) => {
                     const num = String(it.number ?? it.input ?? "");
                     const backendKind = (it.kind || "").toString().toLowerCase();
-                    const kind: "mobile" | "aadhaar" | "unknown" =
-                        backendKind === "mobile" || backendKind === "aadhaar"
+                    const inferred = inferKindFromDigits(num);
+                    const kind: "mobile" | "aadhaar" | "application" | "unknown" =
+                        backendKind === "mobile" || backendKind === "aadhaar" || backendKind === "application"
                             ? (backendKind as any)
-                            : inferKindFromDigits(num);
+                            : inferred;
+                    const st = mapStateToStatus(it);
+                    let msg = it.message || it.last_message || it.detail || "";
+                    if (!msg) {
+                      if (st === "ok") msg = "Completed";
+                      else if (st === "error") msg = "Failed";
+                      else if (st === "processing") msg = "Processing on server…";
+                    }
                     return {
                         number: num,
                         kind,
-                        status: mapStateToStatus(it),
-                        message: it.message || it.last_message || it.detail || ""
+                        status: st,
+                        message: msg
                     };
                 });
 
-                // Only update rows if items is non-empty
                 if (items.length > 0) {
                     setRows(mapped.slice().reverse());
+                } else {
+                    const statusText = String(job.status || "queued").toLowerCase();
+                    const msg = statusText === "running" ? "Processing on server…" : statusText === "queued" ? "Queued on server…" : `Job ${statusText}`;
+                    if (rows && rows.length > 0) {
+                        setRows(rows.map(r => ({ ...r, status: "processing", message: msg })));
+                    } else {
+                        const synthetic: ResultRow = {
+                          number: String(job.id || (typeof id !== "undefined" ? id : jobId) || "job"),
+                          kind: "unknown",
+                          status: mapStateToStatus({ status: job.status, error: (Number(error)||0) > 0 }),
+                          message: `Job ${statusText} • OK: ${ok} • Err: ${error}`.trim()
+                        };
+                        setRows([synthetic]);
+                    }
                 }
 
                 const jStatus = String(job.status || "").toLowerCase();
@@ -877,7 +1270,14 @@ const BulkJobs: React.FC = () => {
             } else {
                 // Treat missing/404 as terminal unless transient
                 if (r.status === 404) {
-                    setParseError("Job not found on server (404). It may have expired.");
+                    if (lastServerActionRef.current === 'cancel' || lastServerActionRef.current === 'delete') {
+                        // Expected right after we canceled/deleted the job
+                        setRows([]);
+                        setProcessing(false);
+                        lastServerActionRef.current = null;
+                        return;
+                    }
+                    setParseError('Job not found on server (404). It may have expired.');
                     setProcessing(false);
                 }
             }
@@ -899,11 +1299,110 @@ const BulkJobs: React.FC = () => {
     function handleLoadRecent(id: string) {
         if (!id) return;
         setJobId(id);
+        lastServerActionRef.current = null;
         setProcessing(true);
-        setRows([]);
         setProgress({ total: 0, done: 0, ok: 0, error: 0 });
-        localStorage.setItem("sla_bulk_last_job", id);
+        localStorage.setItem(LS_JOB_KEY, id);
+        tryRestoreSnapshot(id);
         pollOnceById(id);
+      }
+
+    // Cancel a server job (try multiple backend variants)
+    async function cancelServerJob(id: string): Promise<{ ok: boolean; message?: string }> {
+      if (!id) return { ok: false, message: "Missing job id" };
+      const token = localStorage.getItem("sla_token");
+      const headers: any = { "Accept": "application/json", "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) };
+      const attempts: Array<{ method?: string; path: string; body?: any }> = [
+        { method: "POST", path: `/api/bulk/${id}/cancel` },
+        { method: "POST", path: "/api/bulk/cancel", body: { id } },
+        { method: "PATCH", path: `/api/bulk/${id}`, body: { status: "canceled" } },
+      ];
+      for (const a of attempts) {
+        try {
+          const r = await apiFetch(a.path, { method: a.method || "POST", headers, body: a.body ? JSON.stringify(a.body) : undefined });
+          if (!r.ok) continue;
+          const ct = (r.headers.get("content-type") || "").toLowerCase();
+          if (ct.includes("application/json")) {
+            const j = await r.json();
+            if (j && j.ok !== false) return { ok: true };
+          } else {
+            return { ok: true };
+          }
+        } catch {}
+      }
+      return { ok: false, message: "Cancel request failed on all variants" };
+    }
+
+    // Delete a server job; if purge=true, ask backend to delete all records created by the job
+    async function deleteServerJob(id: string, purge = true): Promise<{ ok: boolean; message?: string }> {
+      if (!id) return { ok: false, message: "Missing job id" };
+      const token = localStorage.getItem("sla_token");
+      const headers: any = { "Accept": "application/json", "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) };
+      const qs = purge ? "?purge=1" : "";
+      const attempts: Array<{ method?: string; path: string; body?: any }> = [
+        { method: "DELETE", path: `/api/bulk/${id}${qs}` },
+        { method: "POST", path: `/api/bulk/${id}/delete${qs}` },
+        { method: "POST", path: "/api/bulk/delete", body: { id, purge } },
+      ];
+      for (const a of attempts) {
+        try {
+          const r = await apiFetch(a.path, { method: a.method || "POST", headers, body: a.body ? JSON.stringify(a.body) : undefined });
+          if (!r.ok) continue;
+          const ct = (r.headers.get("content-type") || "").toLowerCase();
+          if (ct.includes("application/json")) {
+            const j = await r.json();
+            if (j && j.ok !== false) return { ok: true };
+          } else {
+            return { ok: true };
+          }
+        } catch {}
+      }
+      return { ok: false, message: "Delete request failed on all variants" };
+    }
+
+    // UI handlers for cancel/delete with confirmation and local state updates
+    async function handleCancelJobClick(id: string) {
+      if (!id) return;
+      const yes = window.confirm("Cancel this job? Running tasks will be stopped.");
+      if (!yes) return;
+      const res = await cancelServerJob(id);
+      if (!res.ok) {
+        setParseError(res.message || "Failed to cancel job.");
+        return;
+      }
+      // Mark last action, clear persisted job pointers, and stop viewing immediately
+      lastServerActionRef.current = 'cancel';
+      try { localStorage.removeItem(LS_JOB_KEY); } catch {}
+      try { localStorage.removeItem(LS_PROGRESS_KEY); } catch {}
+      // Clear ALL Excel parsing fields/state
+      setFile(null);
+      setNumbers([]);
+      resetAll();
+      handleHideView();
+      // Refresh the recent jobs list
+      setRecentJobs(await fetchRecentServerJobs(2));
+    }
+
+    async function handleDeleteJobClick(id: string) {
+      if (!id) return;
+      const purge = window.confirm("Delete this job AND all records it created?\nThis is irreversible.");
+      if (!purge) return;
+      const res = await deleteServerJob(id, true);
+      if (!res.ok) {
+        setParseError(res.message || "Failed to delete job.");
+        return;
+      }
+      // Mark last action, clear persisted job pointers
+      lastServerActionRef.current = 'delete';
+      try { localStorage.removeItem(LS_JOB_KEY); } catch {}
+      try { localStorage.removeItem(LS_PROGRESS_KEY); } catch {}
+
+      // If the deleted job is currently selected, hide it and clear progress/rows
+      if (jobId === id) {
+        handleHideView();
+      }
+      // Reload recent jobs list
+      setRecentJobs(await fetchRecentServerJobs(2));
     }
 
 
@@ -947,22 +1446,24 @@ const BulkJobs: React.FC = () => {
                             <tr>
                                 <th className="px-3 py-2 text-left font-semibold">Job ID</th>
                                 <th className="px-3 py-2 text-left font-semibold">Created (IST)</th>
+                                <th className="px-3 py-2 text-left font-semibold">Created by</th>
                                 <th className="px-3 py-2 text-left font-semibold">Status</th>
                                 <th className="px-3 py-2 text-left font-semibold">Totals</th>
-                                <th className="px-3 py-2 text-left font-semibold"></th>
+                                <th className="px-3 py-2 text-left font-semibold">Actions</th>
                             </tr>
                         </thead>
                         <tbody>
                             {loadingRecent && (
-                                <tr><td className="px-3 py-3 text-slate-500" colSpan={5}>Loading…</td></tr>
+                                <tr><td className="px-3 py-3 text-slate-500" colSpan={6}>Loading…</td></tr>
                             )}
                             {!loadingRecent && recentJobs.length === 0 && (
-                                <tr><td className="px-3 py-3 text-slate-500" colSpan={5}>No jobs in the last 2 days.</td></tr>
+                                <tr><td className="px-3 py-3 text-slate-500" colSpan={6}>No jobs in the last 2 days.</td></tr>
                             )}
                             {recentJobs.map(j => (
                                 <tr key={j.id} className="odd:bg-white even:bg-slate-50/50 dark:odd:bg-slate-900 dark:even:bg-slate-900/60">
                                     <td className="px-3 py-2 font-mono">{j.id}</td>
                                     <td className="px-3 py-2">{formatIST(j.created_at)}</td>
+                                    <td className="px-3 py-2">{j.created_by || "—"}</td>
                                     <td className="px-3 py-2">
                                         <span className="inline-flex items-center rounded-full bg-slate-100 dark:bg-slate-800 px-2 py-0.5 text-xs">
                                             {j.status || "—"}
@@ -976,13 +1477,29 @@ const BulkJobs: React.FC = () => {
                                         <span className="text-xs text-rose-700">Err:</span> <strong>{j.error ?? 0}</strong>
                                     </td>
                                     <td className="px-3 py-2">
+                                      <div className="flex items-center gap-2 flex-wrap">
                                         <button
-                                            type="button"
-                                            onClick={() => (jobId === j.id ? handleHideView() : handleLoadRecent(j.id))}
-                                            className="rounded-md border border-slate-300 dark:border-slate-700 px-2.5 py-1 text-xs hover:bg-slate-100 dark:hover:bg-slate-800"
+                                          type="button"
+                                          onClick={() => (jobId === j.id ? handleHideView() : handleLoadRecent(j.id))}
+                                          className="rounded-md border border-slate-300 dark:border-slate-700 px-2.5 py-1 text-xs hover:bg-slate-100 dark:hover:bg-slate-800"
                                         >
-                                            {jobId === j.id ? "Hide" : "View"}
+                                          {jobId === j.id ? "Hide" : "View"}
                                         </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleCancelJobClick(j.id)}
+                                          className="rounded-md border border-amber-300 text-amber-700 dark:border-amber-600 px-2.5 py-1 text-xs hover:bg-amber-50 dark:hover:bg-amber-900/20"
+                                        >
+                                          Cancel
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleDeleteJobClick(j.id)}
+                                          className="rounded-md border border-rose-300 text-rose-700 dark:border-rose-600 px-2.5 py-1 text-xs hover:bg-rose-50 dark:hover:bg-rose-900/20"
+                                        >
+                                          Delete
+                                        </button>
+                                      </div>
                                     </td>
                                 </tr>
                             ))}
@@ -1042,28 +1559,21 @@ const BulkJobs: React.FC = () => {
                                     </option>
                                 ))}
                             </select>
-                            <input
-                                type="text"
-                                placeholder="Or type column name (header)"
-                                value={columnName}
-                                onChange={(e) => setColumnName(e.target.value)}
-                                className="mt-2 w-full rounded-lg border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm"
-                            />
-                            <div className="mt-1 text-[11px] text-slate-500">
-                                We will prefer an exact (case‑insensitive) header match here if provided; otherwise we use the selected column.
-                            </div>
 
                             <div className="mt-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/60 p-3 text-sm">
                                 <div className="flex items-center justify-between">
-                                    <span className="text-slate-600 dark:text-slate-300">Detected numbers</span>
+                                    <span className="text-slate-600 dark:text-slate-300">Detected items</span>
                                     <span className="font-semibold">{numbers.length}</span>
                                 </div>
-                                <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
+                                <div className="mt-2 grid grid-cols-4 gap-2 text-xs">
                                     <div className="rounded-md bg-blue-50 dark:bg-blue-900/30 px-2 py-1 text-blue-700 dark:text-blue-200">
                                         Mobile: {detectedCounts.mobile}
                                     </div>
                                     <div className="rounded-md bg-emerald-50 dark:bg-emerald-900/30 px-2 py-1 text-emerald-700 dark:text-emerald-200">
                                         Aadhaar: {detectedCounts.aadhaar}
+                                    </div>
+                                    <div className="rounded-md bg-orange-50 dark:bg-orange-900/30 px-2 py-1 text-orange-700 dark:text-orange-200">
+                                        Application ID: {detectedCounts.application}
                                     </div>
                                     <div className="rounded-md bg-slate-100 dark:bg-slate-800 px-2 py-1 text-slate-700 dark:text-slate-300">
                                         Unknown: {detectedCounts.unknown}
@@ -1072,41 +1582,10 @@ const BulkJobs: React.FC = () => {
                             </div>
                         </div>
 
-                        {/* Preview */}
-                        <div className="col-span-2">
-                            <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Preview</div>
-                            <div className="overflow-auto rounded-lg border border-slate-200 dark:border-slate-700">
-                                <table className="min-w-full text-sm">
-                                    <thead className="bg-slate-100 dark:bg-slate-800">
-                                        <tr>
-                                            {preview[0]?.map((h, i) => (
-                                                <th key={i} className="px-3 py-2 text-left font-semibold text-slate-700 dark:text-slate-200">
-                                                    {String(h ?? `Column ${i + 1}`)}
-                                                </th>
-                                            ))}
-                                        </tr>
-                                    </thead>
-                                    <tbody>
-                                        {preview.slice(1).map((row, rIdx) => (
-                                            <tr key={rIdx} className="odd:bg-white even:bg-slate-50/50 dark:odd:bg-slate-900 dark:even:bg-slate-900/60">
-                                                {row.map((c, cIdx) => (
-                                                    <td key={cIdx} className="px-3 py-2 text-slate-800 dark:text-slate-200 whitespace-nowrap">
-                                                        {c == null ? "" : String(c)}
-                                                    </td>
-                                                ))}
-                                            </tr>
-                                        ))}
-                                        {!preview.length && (
-                                            <tr>
-                                                <td className="px-3 py-4 text-slate-500 dark:text-slate-400">No preview available</td>
-                                            </tr>
-                                        )}
-                                    </tbody>
-                                </table>
-                            </div>
-
-                            {/* Controls */}
-                            <div className="mt-4 flex items-center gap-3">
+                        {/* Controls */}
+                        <div className="col-span-2 flex flex-col justify-between h-full">
+                            <div className="flex-1" />
+                            <div className="flex items-center gap-3">
                                 <button
                                     onClick={runProcessing}
                                     disabled={!rows.length}
@@ -1119,100 +1598,10 @@ const BulkJobs: React.FC = () => {
                                         onClick={cancel}
                                         className="rounded-lg px-4 py-2 font-semibold border border-rose-300 text-rose-700 hover:bg-rose-50 dark:hover:bg-rose-900/20"
                                     >
-                                        Cancel
+                                        {jobId ? "Cancel (server)" : "Cancel"}
                                     </button>
-                                ) : (
-                                    <button
-                                        onClick={() => onFilePicked(file)}
-                                        disabled={!file}
-                                        className="rounded-lg px-4 py-2 font-semibold border border-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-                                    >
-                                        Re-parse
-                                    </button>
-                                )}
+                                ) : null}
                             </div>
-
-                            {/* Progress */}
-                            {(processing || progress.done > 0) && (
-                                <div className="mt-5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-4">
-                                    <div className="flex flex-col sm:flex-row items-center gap-5">
-                                        {/* Circular progress */}
-                                        <div className="flex items-center justify-center">
-                                            {(() => {
-                                                const size = 96;
-                                                const stroke = 10;
-                                                const r = (size - stroke) / 2;
-                                                const c = 2 * Math.PI * r;
-                                                const p = Math.max(0, Math.min(100, pct));
-                                                const dash = (p / 100) * c;
-                                                return (
-                                                    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
-                                                        <circle
-                                                            cx={size / 2}
-                                                            cy={size / 2}
-                                                            r={r}
-                                                            strokeWidth={stroke}
-                                                            stroke="currentColor"
-                                                            className="text-slate-200 dark:text-slate-800"
-                                                            fill="none"
-                                                        />
-                                                        <circle
-                                                            cx={size / 2}
-                                                            cy={size / 2}
-                                                            r={r}
-                                                            strokeWidth={stroke}
-                                                            strokeLinecap="round"
-                                                            stroke="currentColor"
-                                                            className="text-indigo-500"
-                                                            fill="none"
-                                                            strokeDasharray={`${dash} ${c - dash}`}
-                                                            transform={`rotate(-90 ${size / 2} ${size / 2})`}
-                                                        />
-                                                        <text
-                                                            x="50%"
-                                                            y="50%"
-                                                            dominantBaseline="middle"
-                                                            textAnchor="middle"
-                                                            className="fill-slate-700 dark:fill-slate-200 text-sm"
-                                                        >
-                                                            {Math.min(progress.done, progress.total)}/{progress.total}
-                                                        </text>
-                                                    </svg>
-                                                );
-                                            })()}
-                                        </div>
-
-                                        {/* Text info */}
-                                        <div className="flex-1 w-full">
-                                            <div className="flex items-center justify-between">
-                                                <div className="text-sm text-slate-700 dark:text-slate-300">
-                                                    Found <strong>{progress.total}</strong> numbers to process.
-                                                    {processing ? (
-                                                        <span className="ml-2">
-                                                            Processing <strong>{Math.min(progress.done + 1, progress.total)}</strong> / {progress.total}
-                                                            {eta ? ` • ETA ${eta}` : ""}
-                                                        </span>
-                                                    ) : (
-                                                        progress.done > 0 && (
-                                                            <span className="ml-2">Completed <strong>{progress.done}</strong> / {progress.total}</span>
-                                                        )
-                                                    )}
-                                                </div>
-                                                <div className="text-xs text-slate-500">
-                                                    OK: <span className="font-semibold text-emerald-600">{progress.ok}</span> •&nbsp;
-                                                    Errors: <span className="font-semibold text-rose-600">{progress.error}</span>
-                                                </div>
-                                            </div>
-                                            <div className="mt-3 h-3 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
-                                                <div
-                                                    className="h-full rounded-full bg-gradient-to-r from-indigo-500 via-sky-500 to-emerald-500 transition-[width] duration-300 ease-out"
-                                                    style={{ width: `${pct}%` }}
-                                                />
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
                         </div>
                     </div>
                 )}
@@ -1224,6 +1613,54 @@ const BulkJobs: React.FC = () => {
                     </div>
                 )}
             </div>
+
+            {(jobId || processing || progress.total > 0) && (
+  <div className="rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 p-5">
+    <div className="flex flex-col sm:flex-row items-center gap-5">
+      {/* Circular progress */}
+      <div className="flex items-center justify-center">
+        {(() => {
+          const size = 96;
+          const stroke = 10;
+          const r = (size - stroke) / 2;
+          const c = 2 * Math.PI * r;
+          const p = Math.max(0, Math.min(100, pct));
+          const dash = (p / 100) * c;
+          return (
+            <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+              <circle cx={size / 2} cy={size / 2} r={r} strokeWidth={stroke} stroke="currentColor" className="text-slate-200 dark:text-slate-800" fill="none" />
+              <circle cx={size / 2} cy={size / 2} r={r} strokeWidth={stroke} strokeLinecap="round" stroke="currentColor" className="text-indigo-500" fill="none" strokeDasharray={`${dash} ${c - dash}`} transform={`rotate(-90 ${size / 2} ${size / 2})`} />
+              <text x="50%" y="50%" dominantBaseline="middle" textAnchor="middle" className="fill-slate-700 dark:fill-slate-200 text-sm">
+                {completedCount}/{progress.total}
+              </text>
+            </svg>
+          );
+        })()}
+      </div>
+      {/* Text info */}
+      <div className="flex-1 w-full">
+        <div className="flex items-center justify-between">
+          <div className="text-sm text-slate-700 dark:text-slate-300">
+            Found <strong>{progress.total}</strong> items to process.
+            <span className="ml-2">
+              Done <strong>{completedCount}</strong> / {progress.total}
+              {processing && completedCount < progress.total ? (
+                <span> • Processing…{eta ? ` • ETA ${eta}` : ""}</span>
+              ) : null}
+            </span>
+          </div>
+          <div className="text-xs text-slate-500">
+            OK: <span className="font-semibold text-emerald-600">{progress.ok}</span> •&nbsp;
+            Errors: <span className="font-semibold text-rose-600">{progress.error}</span>
+          </div>
+        </div>
+        <div className="mt-3 h-3 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800">
+          <div className="h-full rounded-full bg-gradient-to-r from-indigo-500 via-sky-500 to-emerald-500 transition-[width] duration-300 ease-out" style={{ width: `${pct}%` }} />
+        </div>
+      </div>
+    </div>
+  </div>
+)}
 
             {/* Live list */}
             {!!rows.length && (
@@ -1256,7 +1693,11 @@ const BulkJobs: React.FC = () => {
                                     >
                                         <td className="px-3 py-2">{idx + 1}</td>
                                         <td className="px-3 py-2 font-mono">
-                                            {r.kind === "aadhaar" ? formatAadhaar(r.number) : formatMobile(r.number)}
+                                            {r.kind === "aadhaar"
+                                                ? formatAadhaar(r.number)
+                                                : r.kind === "mobile"
+                                                    ? formatMobile(r.number)
+                                                    : r.number}
                                         </td>
                                         <td className="px-3 py-2 capitalize">{r.kind}</td>
                                         <td className="px-3 py-2">

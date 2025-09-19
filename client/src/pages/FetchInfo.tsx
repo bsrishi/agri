@@ -8,41 +8,20 @@ const API_BASE = (import.meta as any)?.env?.VITE_API_URL
   ? String((import.meta as any).env.VITE_API_URL).replace(/\/+$/, "")
   : "";
 
-// --- Lightweight local caches (used after successful fetch). We do not prefill UI during a new search so old IDs vanish. ---
-const APPS_CACHE_KEY = "sla_cache_apps_by_number"; // { [number]: { ts, apps } }
-const STATUS_CACHE_KEY = "sla_cache_status_by_app"; // { [appId]: { ts, statuses } }
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+// --- Lightweight browser cache for statuses (UI speed only; DB remains source-of-truth)
+const STATUS_CACHE_KEY = "sla_cache_status_by_app_v2";
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24h
 
-function readMap(key: string): any {
-  try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; }
+function _readMap(k: string) { try { return JSON.parse(localStorage.getItem(k) || "{}"); } catch { return {}; } }
+function _writeMap(k: string, v: any) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { } }
+function getCachedStatuses(_appIdRaw: string): StatusRow[] | null {
+  // Browser cache disabled — DB is the cache of record
+  return null;
 }
-function writeMap(key: string, value: any) {
-  try { localStorage.setItem(key, JSON.stringify(value)); } catch { }
+function setCachedStatuses(_appIdRaw: string, _statuses: StatusRow[]) {
+  // No-op
 }
-function getCachedApps(number: string): AppRow[] | null {
-  const map = readMap(APPS_CACHE_KEY);
-  const entry = map[number];
-  if (!entry) return null;
-  if (Date.now() - entry.ts > CACHE_TTL_MS) return null;
-  return Array.isArray(entry.apps) ? entry.apps : null;
-}
-function setCachedApps(number: string, apps: AppRow[]) {
-  const map = readMap(APPS_CACHE_KEY);
-  map[number] = { ts: Date.now(), apps };
-  writeMap(APPS_CACHE_KEY, map);
-}
-function getCachedStatuses(appId: string): StatusRow[] | null {
-  const map = readMap(STATUS_CACHE_KEY);
-  const entry = map[appId];
-  if (!entry) return null;
-  if (Date.now() - entry.ts > CACHE_TTL_MS) return null;
-  return Array.isArray(entry.statuses) ? entry.statuses : null;
-}
-function setCachedStatuses(appId: string, statuses: StatusRow[]) {
-  const map = readMap(STATUS_CACHE_KEY);
-  map[appId] = { ts: Date.now(), statuses };
-  writeMap(STATUS_CACHE_KEY, map);
-}
+
 
 // ---- Tiny formatters & helpers ----
 const fmtInt = (n: number | null | undefined) =>
@@ -50,6 +29,10 @@ const fmtInt = (n: number | null | undefined) =>
 const fmtArea = (n: number | null | undefined) =>
   typeof n === "number" && Number.isFinite(n) ? `${n.toLocaleString()} h` : "—";
 const uniq = <T,>(arr: T[]) => Array.from(new Set(arr));
+
+function canonId(s: string | null | undefined): string {
+  return String(s ?? "").trim().toUpperCase();
+}
 
 /**
  * Format a Date as DD/MM/YYYY, or "—" for null/undefined.
@@ -187,12 +170,81 @@ function splitSurveys(input?: string): string[] {
   );
 }
 
+// --- Company name canonicalization (to eliminate duplicates like case/spacing variants) ---
+function canonCompanyKey(name?: string | null): string | null {
+  if (!name) return null;
+  let t = String(name).trim().toLowerCase();
+
+  // Normalize whitespace and common punctuation
+  t = t.replace(/[\s\.\-_,/()&]+/g, " ");
+
+  // Remove common legal suffixes (keep core identity)
+  t = t.replace(/\b(private|pvt|pvtltd|pvt ltd|privatelimited|limited|ltd|co|company|enterprises|enterprise)\b/g, "");
+
+  // Collapse multiple spaces
+  t = t.replace(/\s+/g, " ").trim();
+
+  // Remove stray quotes
+  t = t.replace(/["'`]+/g, "");
+
+  return t || null;
+}
+
+function prettifyCompanyName(name: string): string {
+  if (!name) return "";
+  // Collapse whitespace first
+  const t = name.replace(/\s+/g, " ").trim();
+  // Simple Title Case without touching existing acronyms fully in caps
+  return t
+    .split(" ")
+    .map(word => {
+      if (word.length <= 2) return word.toUpperCase();
+      if (/^[A-Z0-9]+$/.test(word)) return word; // keep acronyms
+      const lower = word.toLowerCase();
+      return lower.charAt(0).toUpperCase() + lower.slice(1);
+    })
+    .join(" ");
+}
+
+// --- Detect & normalize Application ID (alphanumeric with dashes like NKL-npt-00071412-2017-18) ---
+function isAppIdLike(s: string): boolean {
+  const t = (s || "").trim();
+  // Heuristic: must contain at least one letter and one dash (so we don't mistake 10/12-digit numbers)
+  return /[A-Za-z]/.test(t) && /-/.test(t);
+}
+function cleanAppId(s: string): string {
+  let t = (s || "").trim();
+
+  // Strip wrapping quotes/backticks if present
+  t = t.replace(/^["'`]+|["'`]+$/g, "");
+
+  // Normalize whitespace (incl. non-breaking spaces)
+  t = t.replace(/\u00A0/g, " ").replace(/\s+/g, " ");
+
+  // Drop any trailing non word/dash chars
+  t = t.replace(/[^\w-]+$/g, "");
+
+  // If an alpha tail like “…-2017-18w” exists, drop the tail (keep up to the year segment)
+  t = t.replace(/(^.*?\b\d{4}-\d{2})(?:[A-Za-z]+)$/i, "$1");
+
+  return t;
+}
+
 // ---- Robust fetch helpers (timeout + safe JSON parsing) ----
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, ms = 30000): Promise<Response> {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   try {
     return await fetch(input, { ...init, signal: controller.signal });
+  } catch (e) {
+    // Normalize abort/timeouts so callers can handle them uniformly.
+    const msg = String(e?.message || "");
+    if (e?.name === "AbortError" || /aborted|abort/i.test(msg)) {
+      const err: any = new Error("Request timed out");
+      err.code = "ETIMEDOUT";
+      throw err;
+    }
+    throw e;
   } finally {
     clearTimeout(id);
   }
@@ -221,6 +273,106 @@ async function readJsonSafe(r: Response): Promise<any> {
   }
 }
 
+/**
+ * Try to fetch timeline rows directly from our DB statuses table for this application_id.
+ * Tries a few common endpoints (POST/GET) and normalizes common shapes:
+ * - [ ... ]
+ * - { statuses: [...] }
+ * - { data: [...] }
+ * Returns `null` only if the DB endpoint isn't reachable/doesn't exist.
+ * Returns [] when reachable but no rows found.
+ */
+async function fetchStatusesFromDB(appId: string): Promise<StatusRow[] | null> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  const token = localStorage.getItem("sla_token");
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+
+  type Candidate = { url: string; method: "GET" | "POST"; body?: any };
+
+  const candidates: Candidate[] = [
+    // Try query param first (some backends only expose this)
+    { url: `${API_BASE}/api/statuses?appId=${encodeURIComponent(appId)}`, method: "GET" },
+    // Preferred new-style endpoint (may not be deployed everywhere)
+    { url: `${API_BASE}/api/statuses/by-appid`, method: "POST", body: { appId } },
+    // Common REST variants
+    { url: `${API_BASE}/api/statuses/${encodeURIComponent(appId)}`, method: "GET" },
+    { url: `${API_BASE}/api/statuses/by-application-id/${encodeURIComponent(appId)}`, method: "GET" },
+    // Search-style endpoint used in some builds
+    { url: `${API_BASE}/api/search/statuses`, method: "POST", body: { appId } },
+  ];
+
+  for (const c of candidates) {
+    try {
+      const r = await fetchWithTimeout(
+        c.url,
+        {
+          method: c.method,
+          headers,
+          ...(c.method === "POST" ? { body: JSON.stringify(c.body || {}) } : {}),
+        },
+        30000
+      );
+      if (!r.ok) {
+        // 404 means endpoint exists but no data for this appId — treat as empty result.
+        if (r.status === 404) return [];
+        // Otherwise try next candidate (silent fallback)
+        continue;
+      }
+      const json = await readJsonSafe(r);
+      if (Array.isArray(json)) return json as StatusRow[];
+      if (json && Array.isArray((json as any).statuses)) return (json as any).statuses as StatusRow[];
+      if (json && Array.isArray((json as any).data)) return (json as any).data as StatusRow[];
+      // Unknown shape — consider this candidate unsupported, try next.
+    } catch {
+      // ignore and try next candidate
+    }
+  }
+  // No candidate worked; DB endpoint not available in this environment.
+  return null;
+}
+
+function stripHtmlToText(html: string): string {
+  try {
+    return html
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, " ")
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, " ")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  } catch {
+    return html;
+  }
+}
+
+function parsePrintTextForMeta(text: string): { mobile?: string; district?: string; block?: string; village?: string } {
+  const out: { mobile?: string; district?: string; block?: string; village?: string } = {};
+  const t = ` ${text} `;
+  const m = t.match(/Mobile\s*(?:No\.?|Number)?\s*[:\-]\s*([0-9]{10,12})/i);
+  if (m) out.mobile = m[1];
+  const d = t.match(/District(?:\s*Name)?\s*[:\-]\s*([A-Za-z .]+)/i);
+  if (d) out.district = d[1].trim();
+  const b = t.match(/Block(?:\s*Name)?\s*[:\-]\s*([A-Za-z .]+)/i);
+  if (b) out.block = b[1].trim();
+  const v = t.match(/Village(?:\s*Name)?\s*[:\-]\s*([A-Za-z0-9 .\/\-]+)/i);
+  if (v) out.village = v[1].trim();
+  return out;
+}
+
+async function fetchPrintMeta(appId: string): Promise<{ mobile?: string; district?: string; block?: string; village?: string } | null> {
+  try {
+    const r = await fetchWithTimeout(`${API_BASE}/api/tn-print/${encodeURIComponent(String(appId))}`, { method: "GET" }, 60000);
+    const ct = r.headers.get("content-type") || "";
+    const raw = await r.text();
+    if (!raw) return null;
+    const text = /html|text\//i.test(ct) ? stripHtmlToText(raw) : stripHtmlToText(String(raw));
+    const meta = parsePrintTextForMeta(text);
+    if (!meta.mobile && !meta.district && !meta.block && !meta.village) return null;
+    return meta;
+  } catch {
+    return null;
+  }
+}
+
 /** Normalize a single application row to be UI-friendly */
 function normalizeApp(a: AppRow): AppRow {
   // keep original applied_date text for display if parsing fails; otherwise ISO yyyy-mm-dd for consistency
@@ -229,21 +381,46 @@ function normalizeApp(a: AppRow): AppRow {
 
   return {
     ...a,
-    application_id: String(a.application_id),
-    crop_type: cleanStr(a.crop_type),
+    application_id: cleanAppId(String(a.application_id)),
+    // Accept legacy backend fields too (crop_name → crop_type)
+    crop_type: cleanStr(a.crop_type ?? (a as any).crop_name),
     mi_name: cleanStr(a.mi_name),
     applied_date: niceDate,
-    farmer_name: cleanStr(a.farmer_name),
-    mi_area: cleanNumber(a.mi_area),
-    total_area: cleanNumber(a.total_area),
-    survey_no: normalizeSurvey(a.survey_no),
-    subdivision_no: cleanStr(a.subdivision_no),
+    // Some payloads use farmer / applicant_name
+    farmer_name: cleanStr(
+      a.farmer_name ?? (a as any).farmer ?? (a as any).applicant_name
+    ),
+    mi_area: cleanNumber(
+      a.mi_area ?? (a as any).mi_hectare ?? (a as any).miarea ?? (a as any).mi
+    ),
+    total_area: cleanNumber(
+      a.total_area ?? (a as any).total_hectare ?? (a as any).hectare ?? (a as any).area
+    ),
+    survey_no: normalizeSurvey(
+      a.survey_no ?? (a as any).survey ?? (a as any).survey_number
+    ),
+    subdivision_no: cleanStr(
+      a.subdivision_no ?? (a as any).sub_division_no ?? (a as any).subdivision
+    ),
     farmer_type: cleanStr(a.farmer_type),
     ss: cleanStr(a.ss),
     source: cleanStr(a.source),
     mobile: cleanStr(a.mobile),
     aadhaar: cleanStr(a.aadhaar),
+    district: cleanStr((a as any).district),
+    block: cleanStr((a as any).block),
+    village: cleanStr((a as any).village)
   };
+}
+
+function mergeApps(oldList: AppRow[], newList: AppRow[]): AppRow[] {
+  const map = new Map<string, AppRow>();
+  for (const a of oldList) map.set(String(a.application_id), a);
+  for (const b of newList) {
+    const id = String(b.application_id);
+    if (!map.has(id)) map.set(id, b);
+  }
+  return Array.from(map.values());
 }
 
 // ---- Inline icons (no deps) ----
@@ -308,6 +485,9 @@ type AppRow = {
   source?: string;
   mobile?: string;   // 10-digit mobile if searched via phone
   aadhaar?: string;  // 12-digit aadhaar if searched via aadhaar
+  district?: string;
+  block?: string;
+  village?: string;
 };
 
 
@@ -357,7 +537,12 @@ const ShimmerStyles = () => (
 export default function FetchInfo() {
   const [number, setNumber] = useState("");
   const [apps, setApps] = useState<AppRow[]>([]);
+  // keep a live ref of apps for helpers that run async
+  const appsRef = useRef<AppRow[]>([]);
+  React.useEffect(() => { appsRef.current = apps; }, [apps]);
   const [statusesByApp, setStatusesByApp] = useState<Record<string, StatusRow[]>>({});
+  // Track whether each application's timeline request has completed (success or error)
+  const [timelineLoaded, setTimelineLoaded] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
@@ -371,8 +556,21 @@ export default function FetchInfo() {
   const [statusDone, setStatusDone] = useState(0);
   const [showBanner, setShowBanner] = useState(false);
   const bannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Timer to show banner if local probe is slow
+  const localProbeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const formRef = useRef<HTMLFormElement | null>(null);
   const [iframeErr, setIframeErr] = useState<string | null>(null);
+  // Force unmount/mount of result sections on each new search so old DOM is cleared instantly
+  const [searchKey, setSearchKey] = useState(0);
+  // Track if this search already rendered local cached results
+  const hadLocalPrefillRef = useRef(false);
+  // Tracks if the current search got a server-side DB cache hit
+  const cachedHitRef = useRef(false);
+  // Keep the last search endpoint/body so we can poll for newly discovered apps
+  const lastQueryRef = useRef<{ url: string; body: any; appIdMode: boolean } | null>(null);
+  // Marks that the first HTTP response for this search has arrived
+  const firstResponseRef = useRef(false);
   // Rotating loading messages while government sources are slow
   const rotatingPhrases = React.useMemo(() => [
     "Searching…",
@@ -384,7 +582,7 @@ export default function FetchInfo() {
   // Cycle the message while we're not done, but delay showing rotating phrases by 1 second
   React.useEffect(() => {
     if (phase === "idle" || phase === "done") return;
-    setRotIdx(0); // Hide "Searching…" for 2s, then start cycling
+    setRotIdx(0);
     let intervalId: NodeJS.Timeout | undefined;
     const timeoutId = setTimeout(() => {
       intervalId = setInterval(() => setRotIdx((i) => (i + 1) % rotatingPhrases.length), 1400);
@@ -407,6 +605,10 @@ export default function FetchInfo() {
         clearTimeout(bannerTimerRef.current);
         bannerTimerRef.current = null;
       }
+      if (localProbeTimerRef.current) {
+        clearTimeout(localProbeTimerRef.current);
+        localProbeTimerRef.current = null;
+      }
     };
   }, []);
 
@@ -416,7 +618,7 @@ export default function FetchInfo() {
     const f = iframeRef.current;
     if (!f) return;
     if (!viewAppId) {
-      try { f.removeAttribute('src'); } catch {}
+      try { f.removeAttribute('src'); } catch { }
       return;
     }
     try {
@@ -426,7 +628,7 @@ export default function FetchInfo() {
     } catch (e: any) {
       console.error('iframe src set error:', e?.message || e);
       setIframeErr(e?.message || 'Unable to display preview');
-      try { f.removeAttribute('src'); } catch {}
+      try { f.removeAttribute('src'); } catch { }
     }
   }, [viewAppId]);
 
@@ -440,7 +642,227 @@ export default function FetchInfo() {
   }
 
   const activeReq = useRef(0);
+
   const token = useMemo(() => localStorage.getItem("sla_token"), []);
+
+  // --- Helper: Should we enrich meta for a given app? ---
+  function needsMeta(a: AppRow | undefined | null): boolean {
+    if (!a) return true;
+    const missDistrict = !a.district || !String(a.district).trim();
+    const missBlock    = !a.block || !String(a.block).trim();
+    const missVillage  = !a.village || !String(a.village).trim();
+    const missMobile   = !a.mobile || !String(a.mobile).trim();
+    return missDistrict || missBlock || missVillage || missMobile;
+  }
+  function anyNeedsMeta(list: AppRow[] | undefined | null): boolean {
+    if (!Array.isArray(list) || list.length === 0) return true;
+    // Enrich if ANY app is missing district/block/village/mobile
+    return list.some(needsMeta);
+  }
+  // Pull all applications for a given mobile strictly from our local DB cache (no government calls)
+  async function fetchAppsForMobileLocalOnly(mobile: string): Promise<AppRow[]> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    const token = localStorage.getItem("sla_token");
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    const number = (mobile || "").replace(/\D/g, "");
+    if (!number || number.length < 10) return [];
+
+    try {
+      const rLocal = await fetchWithTimeout(
+        `${API_BASE}/api/search/number`,
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ number, strategy: "local-only" }),
+        },
+        60000
+      );
+      const jLocal = await readJsonSafe(rLocal);
+      const list: AppRow[] = Array.isArray(jLocal?.applications) ? (jLocal.applications as AppRow[]) : [];
+      return list.map(normalizeApp);
+    } catch {
+      return [];
+    }
+  }
+
+
+  /**
+   * Enrich District / Block / Village / (and missing mobile) for a set of application IDs
+   * by scraping the TN print page. Runs sequentially to avoid hammering the source.
+   * Returns how many apps were enriched and the discovered mobile (if any).
+   */
+  async function enrichMetaForApps(appIds: string[], knownMobile?: string): Promise<{ enriched: number; mobile?: string }> {
+    let enriched = 0;
+    let discoveredMobile: string | undefined = knownMobile;
+
+    for (const id of appIds) {
+      // Skip if we already have full meta in state for this app
+      const key = canonId(id);
+      let needsMeta = true;
+      try {
+        const current = (appsRef.current || []).find(a => canonId(a.application_id) === key);
+        if (current && (current.district || current.block || current.village) && current.mobile) {
+          needsMeta = false;
+        }
+      } catch { /* noop */ }
+      if (!needsMeta) continue;
+
+      const meta = await fetchPrintMeta(id);
+      if (!meta) continue;
+
+      // Set/keep discovered mobile
+      if (!discoveredMobile && meta.mobile) {
+        const m = String(meta.mobile).replace(/\D/g, "");
+        if (m.length >= 10) discoveredMobile = m;
+      }
+
+      // Patch current rows with district/block/village/mobile if missing
+      setApps(prev => {
+        if (!prev || !prev.length) return prev;
+        let changed = false;
+        const next = prev.map(a => {
+          if (canonId(a.application_id) !== key) return a;
+          const p: AppRow = { ...a };
+          if (!p.district && meta.district) { p.district = meta.district; changed = true; }
+          if (!p.block && meta.block) { p.block = meta.block; changed = true; }
+          if (!p.village && meta.village) { p.village = meta.village; changed = true; }
+          if (!p.mobile && meta.mobile)  { p.mobile  = meta.mobile;  changed = true; }
+          return p;
+        });
+        if (changed) enriched += 1;
+        return next;
+      });
+    }
+
+    return { enriched, mobile: discoveredMobile };
+  }
+
+  async function enrichFromPrintAndMaybeLoadMobileApps(appId: string): Promise<number> {
+    // First, enrich this application's own meta (district/block/village/mobile)
+    const first = await enrichMetaForApps([appId]);
+    const metaMobile = first.mobile;
+
+    // If mobile discovered, pull all apps for that mobile (local-first, silent)
+    const mobile = (metaMobile || "").replace(/\D/g, "");
+    if (mobile && mobile.length >= 10) {
+      try {
+        // Try local-only first
+        const rLocal = await fetchWithTimeout(
+          `${API_BASE}/api/search/number`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+            body: JSON.stringify({ number: mobile, strategy: "local-only" }),
+          },
+          60000
+        );
+        const jLocal = await readJsonSafe(rLocal);
+        let list: AppRow[] = Array.isArray(jLocal?.applications) ? (jLocal.applications as AppRow[]) : [];
+
+        // If empty, go local-first (may hit remote)
+        if (!list || list.length === 0) {
+          const r = await fetchWithTimeout(
+            `${API_BASE}/api/search/number`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+              body: JSON.stringify({ number: mobile, strategy: "local-first" }),
+            },
+            120000
+          );
+          const j = await readJsonSafe(r);
+          if (Array.isArray(j?.applications)) list = j.applications as AppRow[];
+        }
+
+        if (list && list.length) {
+          const normalized = list.map(normalizeApp);
+          let added = 0;
+          setApps(prev => {
+            const before = prev;
+            const beforeIds = new Set(before.map(a => String(a.application_id)));
+            const merged = mergeApps(before, normalized);
+            const afterIds = new Set(merged.map(a => String(a.application_id)));
+            // Count IDs that appear in after but not in before
+            added = Array.from(afterIds).filter(id => !beforeIds.has(id)).length;
+            return merged;
+          });
+          const newIds = normalized.map(a => a.application_id);
+          setStatusTotal(t => Math.max(t, newIds.length));
+          await Promise.all(newIds.map(id => fetchStatusesFor(id, "local-first")));
+          return added;
+        } else {
+          return 0;
+        }
+      } catch {
+        // swallow enrichment errors
+        return 0;
+      }
+    }
+    // No valid mobile discovered
+    return 0;
+  }
+
+
+  React.useEffect(() => {
+    // Only poll while search is still enriching
+    if (phase !== "cache-miss" && phase !== "fetching-status") return;
+    if (!lastQueryRef.current) return;
+
+    let stopped = false;
+    let unchangedRounds = 0;
+    const maxRounds = 20; // ~60s total (20 * 3s)
+    let rounds = 0;
+
+    const tick = async () => {
+      if (stopped || phase === "done") return;
+      rounds += 1;
+      try {
+        const { url, body } = lastQueryRef.current!;
+        const pollBody = { ...body, strategy: "local-first" };
+        const r = await fetchWithTimeout(
+          url,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+            body: JSON.stringify(pollBody),
+          },
+          30000
+        );
+        const json = await readJsonSafe(r);
+        if (r.ok && json && Array.isArray(json.applications)) {
+          const fresh = (json.applications as AppRow[]).map(normalizeApp);
+          const before = apps;
+          const merged = mergeApps(before, fresh);
+
+          if (merged.length !== before.length) {
+            setApps(merged);
+            // fetch timelines for any *new* apps
+            const oldIds = new Set(before.map(a => a.application_id));
+            const newIds = merged.map(a => a.application_id).filter(id => !oldIds.has(id));
+            if (newIds.length) {
+              setStatusTotal((t) => Math.max(t, merged.length));
+              (async () => {
+                await Promise.all(newIds.map(id => fetchStatusesFor(id, "local-first")));
+              })();
+            }
+            unchangedRounds = 0;
+          } else {
+            unchangedRounds += 1;
+          }
+        } else {
+          unchangedRounds += 1;
+        }
+      } catch {
+        unchangedRounds += 1;
+      }
+      if (rounds >= maxRounds || unchangedRounds >= 5 || stopped || phase === "done") return;
+      setTimeout(tick, 3000);
+    };
+
+    const id = setTimeout(tick, 3000);
+    return () => { stopped = true; clearTimeout(id); };
+  }, [phase, apps, token]);
   const digitsOnly = (v: string) => (v || "").replace(/\D/g, "");
 
   // --- Aggregates & viz data ---
@@ -477,6 +899,14 @@ export default function FetchInfo() {
     } as React.CSSProperties;
   }, [aggregates]);
 
+  // --- Location summary for District / Block / Village ---
+  const locationSummary = useMemo(() => {
+    const districts = uniq(apps.map(a => (a.district || "").trim()).filter(Boolean));
+    const blocks = uniq(apps.map(a => (a.block || "").trim()).filter(Boolean));
+    const villages = uniq(apps.map(a => (a.village || "").trim()).filter(Boolean));
+    return { districts, blocks, villages };
+  }, [apps]);
+
   // --- Per-survey eligibility ---
   const perSurveyEligibility = useMemo(() => {
     if (!apps.length) return [] as SurveyElig[];
@@ -487,7 +917,7 @@ export default function FetchInfo() {
       const surveys = splitSurveys(app.survey_no);
       if (!surveys.length) continue;
 
-      const st = statusesByApp[app.application_id] || [];
+      const st = statusesByApp[canonId(app.application_id)] || [];
       const { item, date } = latestStatusByDateWhere(
         st,
         (r) => typeof r.status === "string" && /work\s*completed/i.test(String(r.status))
@@ -544,7 +974,7 @@ export default function FetchInfo() {
     let mostRecentWorkCompleted: Date | null = null;
 
     for (const a of apps) {
-      const statuses = statusesByApp[a.application_id];
+      const statuses = statusesByApp[canonId(a.application_id)];
       if (!Array.isArray(statuses) || statuses.length === 0) continue;
       for (const row of statuses) {
         const st = (row.status || "").toString();
@@ -599,31 +1029,49 @@ export default function FetchInfo() {
   }, [apps, statusesByApp, perSurveyEligibility]);
 
   // --- Companies preferred by Farmer (latest first) ---
+  // --- Companies preferred by Farmer (latest first, de-duplicated by canonical key) ---
   const companiesPreferred = useMemo(() => {
-    if (!apps.length) return [] as { name: string; latestAt: Date | null }[];
+    if (!apps.length) return [] as { display: string; latestAt: Date | null }[];
 
     // helper: decide the latest meaningful date for an application
     function latestDateForApp(a: AppRow): Date | null {
-      // prefer applied_date if present
       const applied = parseDateLoose(a.applied_date);
-      // also consider latest status date if we have a timeline
-      const statuses = statusesByApp[a.application_id];
+      const statuses = statusesByApp[canonId(a.application_id)];
       const fromStatuses = latestStatusByDate(statuses).date;
       if (applied && fromStatuses) return applied > fromStatuses ? applied : fromStatuses;
       return applied || fromStatuses || null;
     }
 
-    const map = new Map<string, Date | null>();
+    // Map by canonical key to merge case/spacing/legal-suffix variants
+    const map = new Map<string, { display: string; latestAt: Date | null }>();
+
     for (const a of apps) {
-      const name = (a.mi_name || "").trim();
-      if (!name) continue;
+      const rawName = (a.mi_name || "").trim();
+      if (!rawName) continue;
+
+      const key = canonCompanyKey(rawName);
+      if (!key) continue;
+
+      const pretty = prettifyCompanyName(rawName);
       const d = latestDateForApp(a);
-      const prev = map.get(name) || null;
-      if (!prev || (d && prev && d > prev) || (d && !prev)) {
-        map.set(name, d);
+
+      const current = map.get(key);
+      if (!current) {
+        map.set(key, { display: pretty, latestAt: d || null });
+      } else {
+        // Update latest date if this app is newer
+        if (d && (!current.latestAt || d > current.latestAt)) {
+          current.latestAt = d;
+        }
+        // Prefer prettier/longer display if we stored a worse variant
+        if (pretty.length > current.display.length) {
+          current.display = pretty;
+        }
+        map.set(key, current);
       }
     }
-    const arr = Array.from(map.entries()).map(([name, latestAt]) => ({ name, latestAt }));
+
+    const arr = Array.from(map.values());
     arr.sort((a, b) => {
       const ta = a.latestAt ? a.latestAt.getTime() : -Infinity;
       const tb = b.latestAt ? b.latestAt.getTime() : -Infinity;
@@ -633,14 +1081,46 @@ export default function FetchInfo() {
   }, [apps, statusesByApp]);
 
   async function fetchStatusesFor(appId: string, strategy: "local-first" | "local-only" = "local-first") {
+    const rawId = cleanAppId(appId);
+    const key = canonId(rawId);
+
+    // 1) Always try DB statuses table first (using application_id)
+    try {
+      const dbRows = await fetchStatusesFromDB(appId);
+      if (dbRows !== null) {
+        // We reached the DB endpoint successfully.
+        if (dbRows.length > 0) {
+          // Found timeline in DB — use it and stop here.
+          setStatusesByApp((prev) => ({ ...prev, [key]: dbRows }));
+          setTimelineLoaded((prev) => ({ ...prev, [key]: true }));
+          setStatusDone((d) => d + 1);
+          return;
+        }
+        // No rows in DB:
+        if (strategy === "local-only") {
+          // Respect "local-only": mark loaded with empty list and exit.
+          setStatusesByApp((prev) => ({ ...prev, [key]: [] }));
+          setTimelineLoaded((prev) => ({ ...prev, [key]: true }));
+          setCachedStatuses(key, []);
+          setStatusDone((d) => d + 1);
+          return;
+        }
+        // For "local-first": fall through to remote fetch (government sources) to populate fresh.
+        // Do not mark as loaded yet so the shimmer can continue until remote completes.
+      }
+    } catch {
+      // Ignore DB errors and try the legacy path below.
+    }
+
+    // 2) Legacy path (local-first or remote) — backend decides whether to call TN.
     try {
       const r = await fetchWithTimeout(`${API_BASE}/api/search/application`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(localStorage.getItem("sla_token") ? { Authorization: `Bearer ${localStorage.getItem("sla_token")}` } : {}),
         },
-        body: JSON.stringify({ appId, strategy }),
+        body: JSON.stringify({ appId: rawId, strategy }),
       });
       const json = await readJsonSafe(r);
       if (!r.ok || (json && json.ok === false)) {
@@ -648,154 +1128,654 @@ export default function FetchInfo() {
         throw new Error(msg);
       }
       const items: StatusRow[] = Array.isArray(json?.statuses) ? json.statuses : [];
-      setStatusesByApp((prev) => ({ ...prev, [appId]: items }));
-      setCachedStatuses(appId, items);
+      setStatusesByApp((prev) => ({ ...prev, [key]: items }));
+      setTimelineLoaded((prev) => ({ ...prev, [key]: true }));
       setStatusDone((d) => d + 1);
-    } catch (e: any) {
+    } catch (e) {
       console.error("/api/search/application error:", e?.message || e);
+      setStatusesByApp((prev) => ({ ...prev, [key]: [] }));
+      setTimelineLoaded((prev) => ({ ...prev, [key]: true }));
       setStatusDone((d) => d + 1);
-      setStatusesByApp((prev) => ({ ...prev, [appId]: [] }));
-      setCachedStatuses(appId, []);
     }
+  }
+
+  // --- Helper functions for local result/placeholder handling ---
+  function handleLocalResults(list: AppRow[], jsonLocal: any, appIdMode: boolean, clean: string) {
+    const normalized = list.map(normalizeApp);
+    setApps(normalized);
+    setServerEmpty(false);
+    clearProbeAndBanner();
+
+    // If this was an Application-ID search and we already have a mobile (from DB payload),
+    // expand to ALL applications for that mobile using LOCAL DB ONLY (no print/gov calls).
+    (async () => {
+      if (!appIdMode) return;
+      const fromRowMobile = appIdMode
+        ? normalized.find(a => canonId(a.application_id) === canonId(clean) && a.mobile && String(a.mobile).trim())?.mobile
+        : normalized.find(a => a.mobile && String(a.mobile).trim())?.mobile;
+      const fromMetaMobile = cleanStr(jsonLocal?.meta?.mobile);
+      const mobileRaw = (fromRowMobile || fromMetaMobile || "").replace(/\D/g, "");
+      if (!mobileRaw || mobileRaw.length < 10) return;
+
+      try {
+        const extraApps = await fetchAppsForMobileLocalOnly(mobileRaw);
+        if (!extraApps.length) return;
+
+        setApps(prev => {
+          const before = prev || [];
+          const merged = mergeApps(before, extraApps);
+
+          // Fetch timelines for any newly added apps (strictly local-only for speed)
+          const beforeIds = new Set(before.map(a => String(a.application_id)));
+          const newIds = merged.map(a => String(a.application_id)).filter(id => !beforeIds.has(id));
+          if (newIds.length) {
+            setStatusTotal(t => Math.max(t, merged.length));
+            (async () => {
+              await Promise.all(newIds.map(id => fetchStatusesFor(id, "local-only")));
+            })();
+          }
+          return merged;
+        });
+      } catch {
+        // ignore expansion errors
+      }
+    })();
+
+    const preCanon = extractPreCanon(jsonLocal);
+
+    // Apply any prehydrated timelines from server and mark them as loaded (no browser cache)
+if (Object.keys(preCanon).length) {
+  setStatusesByApp(prev => ({ ...prev, ...preCanon }));
+  setTimelineLoaded(prev => ({
+    ...prev,
+    ...Object.fromEntries(Object.keys(preCanon).map(k => [k, true])),
+  }));
+}
+
+    // Ensure placeholders exist for all apps
+    ensurePlaceholders(normalized);
+
+    // Enrich missing District/Block/Village/Mobile only when missing (sequential; doesn’t block UI)
+    (async () => {
+      try {
+        const ids = normalized.map(a => a.application_id);
+        const known = appIdMode ? undefined : clean; // if searching by mobile, pass it along
+        if (anyNeedsMeta(normalized)) {
+          await enrichMetaForApps(ids, known);
+        }
+        // If new apps were added later via mobile enrichment (shouldn’t happen here, but safe-guard)
+        const cur = appsRef.current || [];
+        const pending = cur
+          .map(a => a.application_id)
+          .filter(id => {
+            const key = canonId(id);
+            const arr = statusesByApp[key];
+            return !Array.isArray(arr) || arr.length === 0;
+          });
+        if (pending.length) {
+          setStatusTotal(t => Math.max(t, pending.length));
+          await Promise.all(pending.map(id => fetchStatusesFor(id, "local-first")));
+        }
+      } catch { /* ignore enrichment errors */ }
+    })();
+
+    // For any app that didn't come with a timeline from server or cache, fetch from LOCAL DB now (no banner)
+    const pendingIds = normalized
+    .map(a => a.application_id)
+    .filter(id => {
+      const key = canonId(id);
+      const arr = preCanon[key];
+      return !Array.isArray(arr) || arr.length === 0;
+    });
+
+    if (pendingIds.length > 0) {
+      setStatusTotal(pendingIds.length);
+      setStatusDone(0);
+      setPhase("fetching-status");
+      (async () => {
+        await Promise.all(pendingIds.map(id => fetchStatusesFor(id, "local-first")));
+        setPhase("done");
+      })();
+    } else {
+      setPhase("done");
+    }
+
+    // For Application ID searches, only hit print if local DB lacks meta (district/block/village/mobile)
+    if (appIdMode) {
+      // Only hit print if we have NO mobile at all
+      const noMobile = !normalized.some(a => a.mobile && String(a.mobile).trim());
+      if (noMobile) {
+        (async () => {
+          try { await enrichFromPrintAndMaybeLoadMobileApps(clean); } catch { }
+        })();
+      }
+    }
+
+    setLoading(false);
+  }
+
+  function handlePlaceholderAppId(clean: string) {
+    (async () => {
+      const added = await enrichFromPrintAndMaybeLoadMobileApps(clean);
+      if (added > 0) {
+        // We already populated apps and started timeline fetches inside the enrichment path.
+        clearProbeAndBanner();
+        setPhase("done");
+        setLoading(false);
+        return;
+      }
+      // Fallback to existing placeholder logic if enrichment found nothing
+      const placeholder = [{ application_id: clean, source: "local-db" } as AppRow];
+      const normalized = placeholder.map(normalizeApp);
+      setApps(normalized);
+      setServerEmpty(false);
+      clearProbeAndBanner();
+      ensurePlaceholders(normalized);
+      setStatusTotal(1);
+      setStatusDone(0);
+      // Immediately fetch timeline (local-first so DB is preferred, falls back to remote if needed)
+      setPhase("fetching-status");
+      (async () => {
+        try {
+          await fetchStatusesFor(clean, "local-first");
+        } finally {
+          setPhase("done");
+        }
+      })();
+      setLoading(false);
+    })();
+    return;
+  }
+
+  function clearProbeAndBanner() {
+    if (localProbeTimerRef.current) { clearTimeout(localProbeTimerRef.current); localProbeTimerRef.current = null; }
+    if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
+    setShowBanner(false);
+  }
+
+  function preHydrateTimelines(json: any, normalized: AppRow[]) {
+    const preRaw = (json && (json.statusesByApp || json.timelines)) || null;
+    if (preRaw && typeof preRaw === "object") {
+      const map: Record<string, StatusRow[]> = {};
+      for (const k of Object.keys(preRaw)) {
+        const val = (preRaw as any)[k];
+        if (Array.isArray(val)) map[canonId(k)] = val;
+      }
+      if (Object.keys(map).length) {
+        setStatusesByApp(prev => ({ ...prev, ...map }));
+        setTimelineLoaded(prev => ({ ...prev, ...Object.fromEntries(Object.keys(map).map(k => [k, true])) }));
+      }
+    }
+  }
+
+  function extractPreCanon(json: any): Record<string, StatusRow[]> {
+    const preRaw = (json && (json.statusesByApp || json.timelines)) || null;
+    const out: Record<string, StatusRow[]> = {};
+    if (preRaw && typeof preRaw === "object") {
+      for (const k of Object.keys(preRaw)) {
+        const val = (preRaw as any)[k];
+        if (Array.isArray(val)) out[canonId(k)] = val;
+      }
+    }
+    return out;
+  }
+
+  function ensurePlaceholders(normalized: AppRow[]) {
+    setStatusesByApp(prev => {
+      const next = { ...prev };
+      for (const a of normalized) {
+        const key = canonId(a.application_id);
+        if (next[key] === undefined) next[key] = [];
+      }
+      return next;
+    });
   }
 
   async function onSearch(e: React.FormEvent) {
     e.preventDefault();
-    // Start in "searching" but only show the banner after 1s (to avoid flashing on fast cache hits)
+    // Bump key to clear previous results synchronously
+    setSearchKey((k) => k + 1);
+    hadLocalPrefillRef.current = false;
+    lastQueryRef.current = null; // clear previous search
+    // Start in "searching" but don't show the banner until we know it's a cache miss / pending
     setPhase("searching");
     setRotIdx(0);
     setStatusTotal(0);
     setStatusDone(0);
     setShowBanner(false);
+    cachedHitRef.current = false;
+    firstResponseRef.current = false;
     if (bannerTimerRef.current) {
       clearTimeout(bannerTimerRef.current);
       bannerTimerRef.current = null;
     }
-    bannerTimerRef.current = setTimeout(() => {
-      setShowBanner(true);
-    }, 1000);
+    if (localProbeTimerRef.current) {
+      clearTimeout(localProbeTimerRef.current);
+      localProbeTimerRef.current = null;
+    }
 
     activeReq.current += 1;
     const reqId = activeReq.current;
+
     setApps([]);
     setStatusesByApp({});
-
+    setTimelineLoaded({});
     setHasSearched(true);
     setServerEmpty(false);
     setError(null);
     setLoading(true);
+    // Clear any previous iframe viewer state when starting a new search
+    setViewAppId(null);
+    setIframeErr(null);
 
-    const clean = digitsOnly(number);
+    const raw = String(number || "");
+    const appIdMode = isAppIdLike(raw);
+    const clean = appIdMode ? cleanAppId(raw) : digitsOnly(raw);
 
     try {
-      const r = await fetchWithTimeout(
-        `${API_BASE}/api/search/number`,
+      const url = appIdMode ? `${API_BASE}/api/search/appid` : `${API_BASE}/api/search/number`;
+      // If the local DB probe is slow, show the Searching… banner early so users get feedback.
+      if (localProbeTimerRef.current) {
+        clearTimeout(localProbeTimerRef.current);
+        localProbeTimerRef.current = null;
+      }
+      localProbeTimerRef.current = setTimeout(() => {
+        setShowBanner(true);
+        setRotIdx(0);
+      }, 1000);
+
+      // 1) PROBE LOCAL DB ONLY – if results exist locally, render immediately and skip remote
+      const probeBody = appIdMode
+        ? { appId: clean, strategy: "local-only" }
+        : { number: clean, strategy: "local-only" };
+      const rLocal = await fetchWithTimeout(
+        url,
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             ...(token ? { Authorization: `Bearer ${token}` } : {}),
           },
-          body: JSON.stringify({ number: clean, strategy: "local-first" }),
+          body: JSON.stringify(probeBody),
+        },
+        60000
+      );
+      const jsonLocal = await readJsonSafe(rLocal);
+
+      // Normalize local results (handle array/single and also related apps for appId searches)
+      let localList: AppRow[] = [];
+      if (rLocal.ok) {
+        if (Array.isArray(jsonLocal?.applications)) {
+          localList = jsonLocal.applications as AppRow[];
+        } else if (jsonLocal?.application && typeof jsonLocal.application === "object") {
+          localList = [jsonLocal.application as AppRow];
+        } else if (appIdMode) {
+          // Some backends return related apps (same mobile) when searching by appId
+          const mobArr = Array.isArray(jsonLocal?.applications_from_mobile)
+            ? jsonLocal.applications_from_mobile
+            : [];
+          if (mobArr.length > 0) {
+            localList = mobArr.map((it: any) => ({
+              application_id: cleanAppId(String(it?.application_id || clean)),
+              crop_type: cleanStr(it?.crop_type ?? it?.crop_name),
+              mi_name: cleanStr(it?.mi_name || it?.company_name),
+              applied_date: cleanStr(it?.applied_date),
+              farmer_name: cleanStr(
+                it?.farmer_name ?? it?.farmer ?? it?.applicant_name
+              ),
+              mi_area: cleanNumber(
+                it?.mi_area ?? it?.mi_hectare ?? it?.miarea ?? it?.mi
+              ),
+              total_area: cleanNumber(
+                it?.total_area ?? it?.total_hectare ?? it?.hectare ?? it?.area
+              ),
+              survey_no: cleanStr(
+                it?.survey_no ?? it?.survey ?? it?.survey_number
+              ),
+              subdivision_no: cleanStr(
+                it?.subdivision_no ?? it?.sub_division_no ?? it?.subdivision
+              ),
+              farmer_type: cleanStr(it?.farmer_type),
+              ss: cleanStr(it?.ss),
+              source: "local-db",
+              mobile: cleanStr(jsonLocal?.meta?.mobile),
+              aadhaar: undefined,
+            } as AppRow));
+            // Make searched app (if present) appear first, then sort by applied_date desc
+            localList.sort((a, b) => {
+              const aIs = String(a.application_id) === clean ? -1 : 0;
+              const bIs = String(b.application_id) === clean ? -1 : 0;
+              if (aIs !== bIs) return aIs - bIs; // searched app first
+              const ad = parseDateLoose(a.applied_date || "");
+              const bd = parseDateLoose(b.applied_date || "");
+              const at = ad ? ad.getTime() : -Infinity;
+              const bt = bd ? bd.getTime() : -Infinity;
+              return bt - at; // newest first otherwise
+            });
+          }
+        }
+      }
+
+      // For Application ID search, if nothing found locally, seed a placeholder and do NOT proceed to remote.
+      if (appIdMode && localList.length === 0) {
+        handlePlaceholderAppId(clean);
+        return;
+      }
+      // For mobile search (appIdMode === false), if localList.length === 0, fall through to remote fetch below.
+      if (localList.length > 0) {
+        handleLocalResults(localList, jsonLocal, appIdMode, clean);
+        return;
+      }
+
+      // 2) REMOTE (LOCAL-FIRST) – schedule banner now because we're going to the network
+      firstResponseRef.current = false;
+      if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
+      // show immediately for remote searches
+      setShowBanner(true);
+      setRotIdx(0);
+      if (localProbeTimerRef.current) {
+        clearTimeout(localProbeTimerRef.current);
+        localProbeTimerRef.current = null;
+      }
+
+      const body = appIdMode
+        ? { appId: clean, strategy: "local-first" }
+        : { number: clean, strategy: "local-first" };
+
+      // Remember this query so the poller effect can re-fetch while results trickle in
+      lastQueryRef.current = { url, body, appIdMode };
+
+      const r = await fetchWithTimeout(
+        url,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify(body),
         },
         120000
       );
+      firstResponseRef.current = true;
+      if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
       const json = await readJsonSafe(r);
+
       if (!r.ok || (json && json.ok === false)) {
-        const msg = (json && (json.message || json.error)) || `Search failed (HTTP ${r.status})`;
-        throw new Error(msg);
+        const msg = (json && (json.message || json.error)) || "";
+        const notFoundish = r.status === 404 || /not\s*found|no\s*data|no\s*records/i.test(msg);
+        if (notFoundish) {
+          if (reqId !== activeReq.current) return;
+          setPhase("done");
+          setShowBanner(false);
+          setServerEmpty(true);
+          setApps([]);
+          return;
+        }
+        throw new Error(msg || `Search failed (HTTP ${r.status})`);
       }
 
-      // If apps are cached locally, suppress the banner (cancel delayed show)
       if (json?.cached === true) {
+        cachedHitRef.current = true;
         if (bannerTimerRef.current) {
           clearTimeout(bannerTimerRef.current);
           bannerTimerRef.current = null;
         }
+        // Served list from cache — hide the slow-source banner here; phase will be decided later
         setShowBanner(false);
       }
 
-      const list: AppRow[] = json && Array.isArray(json.applications) ? json.applications : [];
+      // Normalize applications list
+      let list: AppRow[] = [];
+      if (Array.isArray(json?.applications)) {
+        list = json.applications as AppRow[];
+      } else if (json?.application && typeof json.application === "object") {
+        list = [json.application as AppRow];
+      } else if (appIdMode) {
+        // --- When searching by Application ID, show ALL apps found for the discovered mobile/Aadhaar ---
+        const appId = clean; // the cleaned Application ID we searched for
+        const mobArr = Array.isArray(json?.applications_from_mobile)
+          ? json.applications_from_mobile
+          : [];
+
+        // Map every returned application to AppRow, tagging with the discovered mobile from meta
+        const mapped: AppRow[] = mobArr.map((it: any) => ({
+          application_id: String(it?.application_id || appId),
+          crop_type: cleanStr(it?.crop_type ?? it?.crop_name),
+          mi_name: cleanStr(it?.mi_name || it?.company_name),
+          applied_date: cleanStr(it?.applied_date),
+          farmer_name: cleanStr(
+            it?.farmer_name ?? it?.farmer ?? it?.applicant_name
+          ),
+          mi_area: cleanNumber(
+            it?.mi_area ?? it?.mi_hectare ?? it?.miarea ?? it?.mi
+          ),
+          total_area: cleanNumber(
+            it?.total_area ?? it?.total_hectare ?? it?.hectare ?? it?.area
+          ),
+          survey_no: cleanStr(
+            it?.survey_no ?? it?.survey ?? it?.survey_number
+          ),
+          subdivision_no: cleanStr(
+            it?.subdivision_no ?? it?.sub_division_no ?? it?.subdivision
+          ),
+          farmer_type: cleanStr(it?.farmer_type),
+          ss: cleanStr(it?.ss),
+          source: "tn-print",
+          mobile: cleanStr(json?.meta?.mobile),
+          aadhaar: undefined,
+        }));
+
+        if (mapped.length === 0) {
+          // Fallback: if nothing came back, at least render the searched app id
+          list = [{
+            application_id: appId,
+            source: "tn-print",
+            mobile: cleanStr(json?.meta?.mobile),
+          }];
+        } else {
+          // Sort so the searched app (if present) appears first, then by applied_date (desc) when possible.
+          list = mapped.sort((a, b) => {
+            const aIs = String(a.application_id) === appId ? -1 : 0;
+            const bIs = String(b.application_id) === appId ? -1 : 0;
+            if (aIs !== bIs) return aIs - bIs; // searched app first
+
+            const ad = parseDateLoose(a.applied_date || "");
+            const bd = parseDateLoose(b.applied_date || "");
+            const at = ad ? ad.getTime() : -Infinity;
+            const bt = bd ? bd.getTime() : -Infinity;
+            return bt - at; // newest first otherwise
+          });
+        }
+      }
+
       if (reqId !== activeReq.current) return;
 
-      // Insert: determine status fetch strategy
-      const statusStrategy: "local-first" | "local-only" = json?.cached === true ? "local-only" : "local-first";
-
-      // normalize rows from server/DB (handles "NULL", mixed dates, extra commas/spaces)
       const normalized = list.map(normalizeApp);
-
       setApps(normalized);
+      // Ensure immediate display and fetch timelines (local DB first, then government if needed)
+      ensurePlaceholders(normalized);
+      setStatusTotal(normalized.length);
+      setStatusDone(0);
+      setPhase("fetching-status");
+      (async () => {
+        try {
+          await Promise.all(normalized.map(a => fetchStatusesFor(a.application_id, "local-first")));
+        } finally {
+          setPhase("done");
+        }
+      })();
+      // statusesByApp is only hydrated from backend response (statusesByApp/timelines) below
       setServerEmpty(normalized.length === 0);
-      setCachedApps(clean, normalized);
-
-      // --- PHASED progressive loading logic ---
-      const hints: Record<string, boolean> = (json && typeof json === 'object' && (json as any).statusHints) || {};
+      // Try to enrich meta for all apps shown (fetches District/Block/Village/Mobile from print if missing)
       const allIds = normalized.map(a => a.application_id);
+      (async () => {
+        try {
+          if (anyNeedsMeta(normalized)) {
+            const ids = normalized.map(a => a.application_id);
+            const known = appIdMode ? undefined : clean;
+            await enrichMetaForApps(ids, known);
+          }
+        } catch { /* ignore enrichment errors */ }
+      })();
 
+      // If we already displayed local results, suppress any subsequent banners
+      if (hadLocalPrefillRef.current) {
+        setPhase("done");
+        setShowBanner(false);
+        if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
+      }
+      // Phase/banner
       if (normalized.length === 0) {
         setPhase("done");
         setShowBanner(false);
         if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
       } else if (json?.cached === false) {
-        // We didn't have apps locally — inform user we are pulling fresh data.
         setPhase("cache-miss");
-        // Ensure banner is visible while hitting government sources
-        setShowBanner(true);
-      } else {
-        // Cached
-        setShowBanner(false);
         if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
-      }
-
-      if (json?.cached === true) {
-        // Application IDs are available locally — do NOT fetch remotely.
-        // Fetch timelines only from local DB (no TN calls) and do not show the slow-source banner.
+        setRotIdx(0);
+        // Don't show banner yet; only show if there are pending remote fetches (computed below)
+      } else if (json?.cached === true) {
+        // Application IDs were served from our DB cache.
+        // Do NOT touch browser cache; fetch timelines strictly from local DB.
         setStatusTotal(allIds.length);
+        setPhase("fetching-status");
         await Promise.all(allIds.map((id) => fetchStatusesFor(id, "local-only")));
         setPhase("done");
         setShowBanner(false);
         if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
       } else {
-        // Not cached: we may need to fetch timelines from TN (backend will decide, strategy local-first).
-        // First hydrate from local timeline cache when possible to reduce calls.
-        let pendingIds: string[] = [];
-        const hydrated: Record<string, StatusRow[]> = {};
-        for (const a of normalized) {
-          const cs = getCachedStatuses(a.application_id);
-          if (cs) {
-            hydrated[a.application_id] = cs;
-          } else {
-            // No local cache → always fetch, regardless of hints presence/absence.
-            pendingIds.push(a.application_id);
+        // leave banner state unchanged (some sources don't return a `cached` flag)
+      }
+
+      // Pre-hydrate timelines if backend sent them (canonicalized keys)
+      // Pre-hydrate timelines if backend sent them (canonicalized keys)
+      {
+        const preRaw =
+          (json && (json.statusesByApp || json.timelines)) ||
+          (appIdMode && Array.isArray(json?.statuses) ? { [clean]: json.statuses } : null);
+
+        let preCanon: Record<string, StatusRow[]> = {};
+        if (preRaw && typeof preRaw === "object") {
+          for (const k of Object.keys(preRaw)) {
+            const val = (preRaw as any)[k];
+            if (Array.isArray(val)) preCanon[canonId(k)] = val;
           }
         }
-        if (Object.keys(hydrated).length) setStatusesByApp((prev) => ({ ...prev, ...hydrated }));
 
-        if (pendingIds.length > 0) {
+        if (Object.keys(preCanon).length) {
+          const map: Record<string, StatusRow[]> = {};
+          const loaded: Record<string, boolean> = {};
+          for (const a of normalized) {
+            const key = canonId(a.application_id);
+            const arr = preCanon[key];
+            if (Array.isArray(arr)) {
+              map[key] = arr;
+              loaded[key] = true; // mark as loaded
+            }
+          }
+          if (Object.keys(map).length) {
+            setStatusesByApp((prev) => ({ ...prev, ...map }));
+            setTimelineLoaded((prev) => ({ ...prev, ...loaded }));
+          }
+
+          const readyCount = Object.keys(map).length; // server-prehydrated only
+          setStatusTotal(normalized.length);
+          setStatusDone(readyCount);
+          if (readyCount === normalized.length) {
+            cachedHitRef.current = true; // treat as DB/local result
+          }
+        }
+
+        // After merging any server-sent timelines, seed placeholders only for the remaining apps
+        setStatusesByApp((prev) => {
+          const next = { ...prev } as Record<string, StatusRow[]>;
+          for (const a of normalized) {
+            const key = canonId(a.application_id);
+            if (next[key] === undefined) next[key] = [];
+          }
+          return next;
+        });
+
+        // If searching by Application ID and the server sent a single timeline, seed it now
+        if (appIdMode && Array.isArray(json?.statuses) && normalized.length === 1) {
+          const appKey = canonId(normalized[0].application_id);
+          const items = json.statuses as StatusRow[];
+          setStatusesByApp((prev) => ({ ...prev, [appKey]: items }));
+          setTimelineLoaded((prev) => ({ ...prev, [appKey]: true }));
+          // Reflect seeded timeline in progress immediately
+          setStatusTotal((t) => Math.max(t, 1));
+          setStatusDone((d) => Math.max(d, 1));
+        }
+
+        const statusStrategy: "local-first" = "local-first";
+        // Mark if a seeded single-app timeline was sent (so we can skip it in pending fetches)
+        const seededFromSingle = appIdMode && Array.isArray(json?.statuses) && normalized.length === 1;
+        const seededAppKey = seededFromSingle ? normalized[0].application_id : undefined;
+
+        const allIds = normalized.map((a) => a.application_id);
+        const pendingIds = allIds.filter((id) => {
+          const key = canonId(id);
+          const fromServer = preCanon[key];
+          const hasServer = Array.isArray(fromServer) && fromServer.length > 0;
+          return !hasServer && id !== seededAppKey;
+        });
+
+        if (json?.cached !== true && pendingIds.length > 0) {
           setStatusTotal(pendingIds.length);
           setPhase("fetching-status");
-          await Promise.all(pendingIds.map((id) => fetchStatusesFor(id, statusStrategy)));
+          (async () => {
+            await Promise.all(pendingIds.map((id) => fetchStatusesFor(id, statusStrategy)));
+          })();
+          // Do NOT show banner during timeline fetches
           setShowBanner(false);
-          if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
-        } else {
+        } else if (json?.cached !== true && pendingIds.length === 0) {
           setPhase("done");
           setShowBanner(false);
-          if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
+          if (bannerTimerRef.current) {
+            clearTimeout(bannerTimerRef.current);
+            bannerTimerRef.current = null;
+          }
         }
       }
-    } catch (err: any) {
+    } catch (err) {
       if (reqId !== activeReq.current) return;
       if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
+      if (localProbeTimerRef.current) {
+        clearTimeout(localProbeTimerRef.current);
+        localProbeTimerRef.current = null;
+      }
       setShowBanner(false);
-      setPhase("done");
-      setError((err && err.message) ? `Search error: ${err.message}` : "Unable to fetch info");
-      setApps([]);
+
+      const msg = err?.message ? String(err.message) : "";
+      const isAbortOrTimeout =
+        err?.name === "AbortError" ||
+        err?.code === "ETIMEDOUT" ||
+        /aborted|abort|timed\s*out/i.test(msg);
+
+      if (isAbortOrTimeout) {
+        // Silent cancel/timeout: do not surface as an error toast/banner.
+        setPhase("done");
+        setError(null);
+        setApps([]);
+      } else if (/not\s*found|no\s*data|no\s*records/i.test(msg)) {
+        setPhase("done");
+        setServerEmpty(true);
+        setError(null);
+        setApps([]);
+      } else {
+        setPhase("done");
+        setError(msg ? `Search error: ${msg}` : "Unable to fetch info");
+        setApps([]);
+      }
     } finally {
       if (reqId === activeReq.current) setLoading(false);
-      // Do not force phase to "done" here; let it be controlled by actual fetch logic
-      // so we don't prematurely show the empty state.
       if (reqId === activeReq.current && phase === "done") {
         if (bannerTimerRef.current) { clearTimeout(bannerTimerRef.current); bannerTimerRef.current = null; }
+        if (localProbeTimerRef.current) {
+          clearTimeout(localProbeTimerRef.current);
+          localProbeTimerRef.current = null;
+        }
         setShowBanner(false);
       }
     }
@@ -805,12 +1785,23 @@ export default function FetchInfo() {
     <div className="max-w-7xl mx-auto p-6">
       {/* local styles */}<ShimmerStyles />
       {/* Search */}
-      <Card title="Fetch Farmer Info" subtitle="Search using Aadhaar or Mobile number" className="mb-6 shadow-lg">
-        <form onSubmit={onSearch} className="flex gap-4 items-center">
+      <Card title="Fetch Farmer Info" subtitle="Search using Aadhaar, Mobile number, or Application ID" className="mb-6 shadow-lg">
+        <form ref={formRef} onSubmit={onSearch} className="flex gap-4 items-center">
           <Input
-            placeholder="Enter Aadhaar or Mobile number"
+            placeholder="Enter Aadhaar / Mobile / Application ID"
             value={number}
             onChange={(e) => setNumber(e.target.value)}
+            onKeyDown={(e: any) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                const f = formRef.current;
+                if (f) {
+                  const rs: any = (f as any).requestSubmit;
+                  if (typeof rs === "function") rs.call(f);
+                  else f.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+                }
+              }
+            }}
             className="rounded-lg border border-gray-300 focus:ring-2 focus:ring-green-500 focus:outline-none placeholder-gray-400 px-4 py-2 flex-grow"
           />
           <Button
@@ -842,8 +1833,8 @@ export default function FetchInfo() {
       )}
 
       {/* Aggregates / Graphics */}
-      {apps.length > 0 && aggregates && (
-        <Card className="mb-8 shadow-md">
+      {(phase === "searching" || phase === "cache-miss" || phase === "fetching-status" || phase === "done") && apps.length > 0 && aggregates && (
+        <Card key={`agg-${searchKey}`} className="mb-8 shadow-md">
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-stretch">
             {/* Completion / Eligibility banner */}
             {completionSummary && (
@@ -887,10 +1878,10 @@ export default function FetchInfo() {
               <div className="lg:col-span-3 -mt-1">
                 <div className="mt-4 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden bg-white dark:bg-slate-800">
                   <div className="px-4 py-3 text-sm font-semibold text-slate-800 dark:text-slate-200 flex items-center gap-2">
-                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+                    <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M3 6h18M3 12h18M3 18h18" /></svg>
                     Survey No - Eligibility
                   </div>
-                  <div className="overflow-x-auto">
+                  <div>
                     <table className="min-w-full text-sm">
                       <thead className="bg-slate-50 dark:bg-slate-900/40 text-slate-600 dark:text-slate-300">
                         <tr>
@@ -953,6 +1944,15 @@ export default function FetchInfo() {
                   <div className="text-base font-semibold text-slate-900 dark:text-slate-100">
                     {uniq(apps.map(a => a.farmer_name || "").filter(Boolean)).join(", ") || "—"}
                   </div>
+                  {/* Mobile number (first non-empty) */}
+                  {apps.some(a => a.mobile) && (
+                    <div className="text-xs text-slate-500 flex items-center gap-1 mt-0.5">
+                      <svg viewBox="0 0 24 24" className="h-3.5 w-3.5" fill="none" stroke="currentColor" strokeWidth="1.8">
+                        <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6A19.79 19.79 0 0 1 2.08 6.18 2 2 0 0 1 4 4h3a2 2 0 0 1 2 1.72c.12.81.37 1.6.72 2.33a2 2 0 0 1-.45 2.18l-1.27 1.27a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.18-.45c.73.35 1.52.6 2.33.72A2 2 0 0 1 20 16.92h2z"/>
+                      </svg>
+                      {apps.find(a => a.mobile)?.mobile}
+                    </div>
+                  )}
                   {aggregates.latestApplied ? (
                     <div className="text-xs text-slate-500 flex items-center gap-1 mt-0.5"><DateIcon className="h-3.5 w-3.5" />Last applied: {fmtDate(new Date(aggregates.latestApplied))}</div>
                   ) : null}
@@ -979,6 +1979,38 @@ export default function FetchInfo() {
               </div>
             </div>
 
+            {/* District / Block / Village summary (above Companies preferred) */}
+            {(locationSummary.districts.length > 0 || locationSummary.blocks.length > 0 || locationSummary.villages.length > 0) && (
+              <div className="lg:col-span-3 -mt-1">
+                <div className="mt-4 rounded-xl border border-slate-200 dark:border-slate-700 overflow-hidden bg-white dark:bg-slate-800">
+                  <div className="overflow-x-auto">
+                    <table className="min-w-full text-sm">
+                      <thead className="bg-slate-50 dark:bg-slate-900/40 text-slate-600 dark:text-slate-300">
+                        <tr>
+                          <th className="text-left px-4 py-2 font-medium">District</th>
+                          <th className="text-left px-4 py-2 font-medium">Block</th>
+                          <th className="text-left px-4 py-2 font-medium">Village</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-200 dark:divide-slate-700">
+                        <tr className="text-slate-800 dark:text-slate-200">
+                          <td className="px-4 py-2 align-top">
+                            {locationSummary.districts.length ? locationSummary.districts.join(", ") : "—"}
+                          </td>
+                          <td className="px-4 py-2 align-top">
+                            {locationSummary.blocks.length ? locationSummary.blocks.join(", ") : "—"}
+                          </td>
+                          <td className="px-4 py-2 align-top">
+                            {locationSummary.villages.length ? locationSummary.villages.join(", ") : "—"}
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Companies preferred by Farmer (latest first) */}
             {companiesPreferred.length > 0 && (
               <div className="lg:col-span-3 mt-2">
@@ -990,13 +2022,15 @@ export default function FetchInfo() {
                   <div className="mt-3 flex flex-wrap gap-2">
                     {companiesPreferred.map((c) => (
                       <span
-                        key={c.name}
+                        key={c.display}
                         className="inline-flex items-center gap-2 rounded-full border border-emerald-200/70 dark:border-emerald-700/50 bg-emerald-50/60 dark:bg-emerald-900/10 px-3 py-1 text-sm text-emerald-800 dark:text-emerald-200"
                         title={c.latestAt ? `Latest activity: ${c.latestAt.toLocaleString()}` : undefined}
                       >
-                        <span className="font-semibold truncate max-w-[14rem]">{c.name}</span>
+                        <span className="font-semibold truncate max-w-[14rem]">{c.display}</span>
                         {c.latestAt && (
-                          <span className="text-[11px] text-emerald-700/70 dark:text-emerald-300/70">{fmtDate(c.latestAt)}</span>
+                          <span className="text-[11px] text-emerald-700/70 dark:text-emerald-300/70">
+                            {fmtDate(c.latestAt)}
+                          </span>
                         )}
                       </span>
                     ))}
@@ -1009,10 +2043,11 @@ export default function FetchInfo() {
       )}
 
       {/* Applications list */}
-      {apps.length > 0 && (
-        <div className="grid grid-cols-1 xl:grid-cols-2 gap-x-10 gap-y-8 mb-10">
+      {(phase === "searching" || phase === "cache-miss" || phase === "fetching-status" || phase === "done") && apps.length > 0 && (
+        <div key={`list-${searchKey}`} className="grid grid-cols-1 xl:grid-cols-2 gap-x-10 gap-y-8 mb-10">
           {apps.map((a) => {
-            const statuses = statusesByApp[a.application_id];
+            const appKey = canonId(a.application_id);
+            const statuses = statusesByApp[appKey];
             // Normalize and sort by actual timestamp (handles formats like "22-09-2023 12:04:17 PM")
             // Sort DESCENDING by actual timestamp (latest first). Undated items (NEG_INF) go last.
             // Stable: preserve original order when timestamps are equal.
@@ -1067,7 +2102,7 @@ export default function FetchInfo() {
             const latestFromSorted: StatusRow | undefined =
               sortedStatuses?.find(s => !!parseDateLoose(String(s.status_date))) || (sortedStatuses?.[0]);
             const latestStatus = (latestFromSorted?.status as string | undefined) ?? a.ss ?? undefined;
-  return (
+            return (
               <Card key={a.application_id} className="shadow-md p-4 flex flex-col gap-3">
                 {/* Application ID band (premium header) */}
                 <div className="mb-6 relative overflow-hidden rounded-2xl border border-emerald-200 dark:border-emerald-700 bg-gradient-to-br from-emerald-50/80 via-white to-emerald-50/60 dark:from-emerald-900/10 dark:via-slate-900 dark:to-emerald-900/5 p-4 shadow-[0_8px_24px_rgba(16,185,129,.15)] ring-1 ring-emerald-500/10">
@@ -1121,9 +2156,23 @@ export default function FetchInfo() {
                   {/* Subline: last update or loading */}
                   <div className="mt-2 flex items-center gap-3 text-[11px] text-emerald-900/80 dark:text-emerald-200/80">
                     {(() => {
+                      const appKey = canonId(a.application_id);
                       const s = sortedStatuses;
-                      if (statusesByApp[a.application_id] === undefined) {
-                        // loading shimmer
+
+                      // If we already have statuses, show them immediately
+                      if (Array.isArray(s) && s.length > 0) {
+                        const firstDated = s.find(it => !!parseDateLoose(String(it?.status_date)));
+                        const last = firstDated ? parseDateLoose(String(firstDated.status_date)) : null;
+                        return last ? (
+                          <span className="inline-flex items-center gap-2">
+                            <DateIcon className="h-3.5 w-3.5" />
+                            <span>Last update: {fmtDate(last)} • {timeAgo(last)}</span>
+                          </span>
+                        ) : null;
+                      }
+
+                      // Otherwise, only show shimmer if not yet loaded
+                      if (!timelineLoaded[appKey]) {
                         return (
                           <span className="inline-flex items-center gap-2">
                             <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
@@ -1134,8 +2183,10 @@ export default function FetchInfo() {
                           </span>
                         );
                       }
+
                       const firstDated = (s as StatusRow[] | undefined)?.find(it => !!parseDateLoose(String(it?.status_date)));
                       const last = firstDated ? parseDateLoose(String(firstDated.status_date)) : null;
+
                       return last ? (
                         <span className="inline-flex items-center gap-2">
                           <DateIcon className="h-3.5 w-3.5" />
@@ -1208,11 +2259,27 @@ export default function FetchInfo() {
                 <div className="mt-5 border-t border-slate-200 dark:border-slate-700" />
                 {/* Timeline */}
                 <div className="mt-6">
-                  {statuses ? (
-                    sortedStatuses && sortedStatuses.length > 0 ? <Timeline items={sortedStatuses} /> : <div className="text-sm text-gray-500">No timeline yet.</div>
-                  ) : (
-                    <div className="text-sm text-gray-400">Loading timeline…</div>
-                  )}
+                  {(() => {
+                    const key = canonId(a.application_id);
+                    const loaded = !!timelineLoaded[key];
+                    if (!loaded) {
+                      return (
+                        <div className="text-sm text-amber-700 dark:text-amber-300 flex items-center gap-2">
+                          <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+                          <span className="relative inline-block overflow-hidden rounded-full bg-amber-50/70 dark:bg-amber-900/20 px-2 py-0.5">
+                            <span className="absolute inset-0 -translate-x-full animate-[shimmer_1.5s_infinite] bg-gradient-to-r from-transparent via-white/50 to-transparent dark:via-white/10" />
+                            Fetching info…
+                          </span>
+                        </div>
+                      );
+                    }
+                    // Request finished: show the timeline if we have items, otherwise show a clear empty state
+                    return sortedStatuses && sortedStatuses.length > 0 ? (
+                      <Timeline items={sortedStatuses} />
+                    ) : (
+                      <div className="text-sm text-gray-500">No timeline yet.</div>
+                    );
+                  })()}
                 </div>
 
               </Card>
@@ -1232,63 +2299,63 @@ export default function FetchInfo() {
           ) : (
             <div className="text-center">
               <svg viewBox="0 0 64 64" className="mx-auto h-16 w-16 text-slate-300"><circle cx="28" cy="28" r="12" stroke="currentColor" fill="none" /><path d="M44 44l12 12" stroke="currentColor" /></svg>
-              <div className="mt-3 text-base text-slate-600">Enter a 10–12 digit Aadhaar/Mobile number and press Search.</div>
+              <div className="mt-3 text-base text-slate-600">Enter a Mobile/Aadhaar number (10–12 digits) or an Application ID and press Search.</div>
             </div>
           )}
         </div>
       )}
-    {/* Modal/Overlay for viewing application */}
-    {viewAppId && (
-      <div className="fixed inset-0 z-[100]">
-        {/* Backdrop - clicking closes the viewer */}
-        <div
-          className="absolute inset-0 bg-black/50"
-          onClick={() => setViewAppId(null)}
-        />
+      {/* Modal/Overlay for viewing application */}
+      {viewAppId && (
+        <div className="fixed inset-0 z-[100]">
+          {/* Backdrop - clicking closes the viewer */}
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => setViewAppId(null)}
+          />
 
-        {/* Modal container */}
-        <div
-          className="absolute inset-4 md:inset-10 bg-white dark:bg-slate-900 rounded-xl shadow-2xl overflow-hidden flex flex-col"
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 dark:border-slate-700">
-            <div className="text-sm font-semibold text-slate-800 dark:text-slate-200">
-              Application: {viewAppId}
-            </div>
-            <button
-              type="button"
-              onClick={() => setViewAppId(null)}
-              className="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 text-xs hover:bg-slate-100 dark:hover:bg-slate-800"
-              aria-label="Close viewer"
-              title="Close"
-            >
-              Close
-            </button>
-          </div>
-          <div className="flex-1 flex items-center justify-center overflow-auto">
-            {iframeErr ? (
-              <div className="p-4 text-sm text-rose-700 bg-rose-50 rounded-md border border-rose-200">
-                {iframeErr}.{" "}
-                <a
-                  href={viewAppId ? `${API_BASE}/api/tn-print/${encodeURIComponent(String(viewAppId))}` : '#'}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="underline font-semibold"
-                >
-                  Open in new tab
-                </a>
+          {/* Modal container */}
+          <div
+            className="absolute inset-4 md:inset-10 bg-white dark:bg-slate-900 rounded-xl shadow-2xl overflow-hidden flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-3 py-2 border-b border-slate-200 dark:border-slate-700">
+              <div className="text-sm font-semibold text-slate-800 dark:text-slate-200">
+                Application: {viewAppId}
               </div>
-            ) : (
-              <iframe
-                ref={iframeRef}
-                src="about:blank"
-                className="w-[80%] h-[80%] max-w-full max-h-full border-none"
-              />
-            )}
+              <button
+                type="button"
+                onClick={() => setViewAppId(null)}
+                className="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 text-xs hover:bg-slate-100 dark:hover:bg-slate-800"
+                aria-label="Close viewer"
+                title="Close"
+              >
+                Close
+              </button>
+            </div>
+            <div className="flex-1 flex items-center justify-center overflow-auto">
+              {iframeErr ? (
+                <div className="p-4 text-sm text-rose-700 bg-rose-50 rounded-md border border-rose-200">
+                  {iframeErr}.{" "}
+                  <a
+                    href={viewAppId ? `${API_BASE}/api/tn-print/${encodeURIComponent(String(viewAppId))}` : '#'}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline font-semibold"
+                  >
+                    Open in new tab
+                  </a>
+                </div>
+              ) : (
+                <iframe
+                  ref={iframeRef}
+                  src="about:blank"
+                  className="w-[80%] h-[80%] max-w-full max-h-full border-none"
+                />
+              )}
+            </div>
           </div>
         </div>
-      </div>
-    )}
+      )}
     </div>
   );
 }

@@ -132,7 +132,7 @@ CREATE INDEX IF NOT EXISTS idx_statuses_app_id      ON statuses (application_id)
 ---------------------------------------------------------------------*/
 CREATE TABLE IF NOT EXISTS bulk_jobs (
   id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_by UUID,                 -- optional: FK to users.id if you want
+  created_by TEXT,                 -- name of user who created the job
   total      INTEGER NOT NULL DEFAULT 0,
   done       INTEGER NOT NULL DEFAULT 0,
   ok         INTEGER NOT NULL DEFAULT 0,
