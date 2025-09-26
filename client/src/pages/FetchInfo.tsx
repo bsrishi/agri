@@ -1264,24 +1264,16 @@ if (Object.keys(preCanon).length) {
         setLoading(false);
         return;
       }
-      // Fallback to existing placeholder logic if enrichment found nothing
-      const placeholder = [{ application_id: clean, source: "local-db" } as AppRow];
-      const normalized = placeholder.map(normalizeApp);
-      setApps(normalized);
-      setServerEmpty(false);
+
+      // No enrichment found → treat as invalid Application ID and clear all UI sections
+      setApps([]);
+      setStatusesByApp({});
+      setTimelineLoaded({});
+      setServerEmpty(true);
       clearProbeAndBanner();
-      ensurePlaceholders(normalized);
-      setStatusTotal(1);
+      setStatusTotal(0);
       setStatusDone(0);
-      // Immediately fetch timeline (local-first so DB is preferred, falls back to remote if needed)
-      setPhase("fetching-status");
-      (async () => {
-        try {
-          await fetchStatusesFor(clean, "local-first");
-        } finally {
-          setPhase("done");
-        }
-      })();
+      setPhase("done");
       setLoading(false);
     })();
     return;
@@ -1456,10 +1448,10 @@ if (Object.keys(preCanon).length) {
         }
       }
 
-      // For Application ID search, if nothing found locally, seed a placeholder and do NOT proceed to remote.
+      // For Application ID search, if nothing found locally, seed a placeholder but continue to remote fetch.
       if (appIdMode && localList.length === 0) {
         handlePlaceholderAppId(clean);
-        return;
+        // Do not return here; we will fall through to the remote (LOCAL-FIRST) branch below
       }
       // For mobile search (appIdMode === false), if localList.length === 0, fall through to remote fetch below.
       if (localList.length > 0) {
@@ -1782,11 +1774,11 @@ if (Object.keys(preCanon).length) {
   }
 
   return (
-    <div className="max-w-7xl mx-auto p-6">
+    <div className="mx-auto max-w-7xl px-3 sm:px-4 lg:px-6 py-4 sm:py-6">
       {/* local styles */}<ShimmerStyles />
       {/* Search */}
       <Card title="Fetch Farmer Info" subtitle="Search using Aadhaar, Mobile number, or Application ID" className="mb-6 shadow-lg">
-        <form ref={formRef} onSubmit={onSearch} className="flex gap-4 items-center">
+        <form ref={formRef} onSubmit={onSearch} className="flex flex-col sm:flex-row gap-3 sm:gap-4 items-stretch sm:items-center">
           <Input
             placeholder="Enter Aadhaar / Mobile / Application ID"
             value={number}
@@ -1802,12 +1794,12 @@ if (Object.keys(preCanon).length) {
                 }
               }
             }}
-            className="rounded-lg border border-gray-300 focus:ring-2 focus:ring-green-500 focus:outline-none placeholder-gray-400 px-4 py-2 flex-grow"
+            className="w-full rounded-lg border border-gray-300 focus:ring-2 focus:ring-green-500 focus:outline-none placeholder-gray-400 px-4 py-2"
           />
           <Button
             type="submit"
             disabled={loading}
-            className="bg-gradient-to-r from-green-500 to-emerald-600 text-white font-semibold rounded-lg px-6 py-2 transform transition-transform duration-300 hover:scale-105 shadow-md disabled:opacity-60"
+            className="w-full sm:w-auto bg-gradient-to-r from-green-500 to-emerald-600 text-white font-semibold rounded-lg px-6 py-2.5 transform transition-transform duration-300 hover:scale-105 shadow-md disabled:opacity-60"
           >
             Search
           </Button>
@@ -1817,7 +1809,7 @@ if (Object.keys(preCanon).length) {
 
       {/* Progressive status banner for slow TN APIs */}
       {showBanner && (phase !== "idle" && phase !== "done") && (
-        <div className="mb-6 rounded-xl border border-amber-200/70 bg-amber-50 text-amber-900 dark:border-amber-700/50 dark:bg-amber-900/20 dark:text-amber-200 px-4 py-3 flex items-center justify-between">
+        <div className="mb-6 rounded-xl border border-amber-200/70 bg-amber-50 text-amber-900 dark:border-amber-700/50 dark:bg-amber-900/20 dark:text-amber-200 p-3 sm:px-4 sm:py-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <span className="h-2.5 w-2.5 rounded-full bg-amber-500 animate-pulse" />
             <span className="font-medium">
@@ -1835,7 +1827,7 @@ if (Object.keys(preCanon).length) {
       {/* Aggregates / Graphics */}
       {(phase === "searching" || phase === "cache-miss" || phase === "fetching-status" || phase === "done") && apps.length > 0 && aggregates && (
         <Card key={`agg-${searchKey}`} className="mb-8 shadow-md">
-          <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-stretch">
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 sm:gap-5 md:gap-6 items-stretch">
             {/* Completion / Eligibility banner */}
             {completionSummary && (
               <div className="lg:col-span-3 rounded-2xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 p-4 flex items-center justify-between">
@@ -1850,13 +1842,13 @@ if (Object.keys(preCanon).length) {
                 </div>
                 <div className="flex items-center gap-2">
                   {completionSummary.eligibleNow ? (
-                    <span className="inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ring-1 bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-500/10 dark:text-emerald-300">Eligible</span>
+                    <span className="inline-flex items-center rounded-full px-3 py-1 text-[11px] sm:text-xs font-semibold ring-1 bg-emerald-50 text-emerald-700 ring-emerald-600/20 dark:bg-emerald-500/10 dark:text-emerald-300">Eligible</span>
                   ) : (
                     <>
-                      <span className="inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ring-1 bg-rose-50 text-rose-700 ring-rose-600/20 dark:bg-rose-500/10 dark:text-rose-300">Not Eligible</span>
+                      <span className="inline-flex items-center rounded-full px-3 py-1 text-[11px] sm:text-xs font-semibold ring-1 bg-rose-50 text-rose-700 ring-rose-600/20 dark:bg-rose-500/10 dark:text-rose-300">Not Eligible</span>
                       <span
                         className={
-                          `inline-flex items-center rounded-full px-3 py-1 text-xs font-semibold ring-1 ` +
+                          `inline-flex items-center rounded-full px-3 py-1 text-[11px] sm:text-xs font-semibold ring-1 ` +
                           (completionSummary.counterTone === 'red'
                             ? 'bg-rose-50 text-rose-700 ring-rose-600/20 dark:bg-rose-500/10 dark:text-rose-300'
                             : completionSummary.counterTone === 'green'
@@ -1909,15 +1901,15 @@ if (Object.keys(preCanon).length) {
                             <tr key={sv.survey} className="text-slate-800 dark:text-slate-200">
                               <td className="px-4 py-2 whitespace-nowrap font-medium">{"" + sv.survey}</td>
                               <td className="px-4 py-2">{completedStr}</td>
-                              <td className="px-4 py-2">{nextDueStr}</td>
+                              <td className="px-4 py-2 whitespace-nowrap">{nextDueStr}</td>
                               <td className="px-4 py-2">
                                 <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ring-1 ${statusBadgeClass}`}>
                                   {statusText}
                                 </span>
                               </td>
-                              <td className="px-4 py-2">
-                                {sv.eligibleNow ? "0" : Math.max(0, sv.daysLeft)}
-                              </td>
+                              <td className="px-4 py-2 whitespace-nowrap">
+  {sv.eligibleNow ? "0" : Math.max(0, sv.daysLeft)}
+</td>
                             </tr>
                           );
                         })}
@@ -1929,14 +1921,14 @@ if (Object.keys(preCanon).length) {
             )}
             {/* Left: Stats tiles */}
             <div className="h-full">
-              <div className="h-full rounded-xl border border-slate-200 p-4 bg-white dark:bg-slate-800 flex flex-col justify-between">
+              <div className="h-full rounded-xl border border-slate-200 p-3 sm:p-4 md:p-5 bg-white dark:bg-slate-800 flex flex-col justify-between">
                 <div className="flex items-center gap-2 text-slate-500 text-xs font-medium uppercase tracking-wide"><IdIcon className="h-4 w-4" />Applications</div>
                 <div className="mt-1 text-2xl font-bold text-slate-900 dark:text-slate-100">{fmtInt(apps.length)}</div>
               </div>
             </div>
 
             {/* Middle: Farmer summary (when consistent) */}
-            <div className="h-full rounded-2xl border border-slate-200 p-4 bg-gradient-to-br from-emerald-50 to-white dark:from-slate-800 dark:to-slate-900">
+            <div className="h-full rounded-2xl border border-slate-200 p-3 sm:p-4 md:p-5 bg-gradient-to-br from-emerald-50 to-white dark:from-slate-800 dark:to-slate-900">
               <div className="flex items-center gap-3">
                 <div className="h-10 w-10 rounded-full grid place-items-center bg-emerald-500/10 text-emerald-600"><FarmerIcon className="h-5 w-5" /></div>
                 <div>
@@ -2044,7 +2036,7 @@ if (Object.keys(preCanon).length) {
 
       {/* Applications list */}
       {(phase === "searching" || phase === "cache-miss" || phase === "fetching-status" || phase === "done") && apps.length > 0 && (
-        <div key={`list-${searchKey}`} className="grid grid-cols-1 xl:grid-cols-2 gap-x-10 gap-y-8 mb-10">
+        <div key={`list-${searchKey}`} className="grid grid-cols-1 xl:grid-cols-2 gap-4 sm:gap-6 md:gap-x-8 md:gap-y-8 xl:gap-x-10 xl:gap-y-10 mb-10">
           {apps.map((a) => {
             const appKey = canonId(a.application_id);
             const statuses = statusesByApp[appKey];
@@ -2200,7 +2192,7 @@ if (Object.keys(preCanon).length) {
                 <div className="mt-2 mb-2 border-t border-slate-200 dark:border-slate-700" />
 
                 {/* Meta grid */}
-                <div className="mt-3 grid grid-cols-2 gap-x-6 gap-y-2 text-sm">
+                <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
                   <div className="flex items-center gap-2 text-slate-700 dark:text-slate-300"><FarmerIcon className="h-4 w-4" />{a.farmer_name || "—"}</div>
                   <div className="flex items-center gap-2 text-slate-700 dark:text-slate-300"><LeafIcon className="h-4 w-4" />{a.crop_type || "—"}</div>
                   {a.applied_date ? (
@@ -2214,7 +2206,7 @@ if (Object.keys(preCanon).length) {
                 </div>
 
                 {/* Area Pie + Details */}
-                <div className="mt-5 grid grid-cols-2 gap-4 items-center">
+                <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-4 items-center">
                   {/* Left: Mini Pie */}
                   <div className="flex flex-col items-start">
                     <div className="relative h-20 w-20 rounded-full" style={appAreaStyle} aria-label="MI vs Total Area">
@@ -2325,7 +2317,7 @@ if (Object.keys(preCanon).length) {
               <button
                 type="button"
                 onClick={() => setViewAppId(null)}
-                className="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 text-xs hover:bg-slate-100 dark:hover:bg-slate-800"
+                className="rounded-md border border-slate-300 dark:border-slate-700 px-2 py-1 text-xs hover:bg-slate-100 dark:hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-blue-400/40"
                 aria-label="Close viewer"
                 title="Close"
               >
@@ -2349,7 +2341,7 @@ if (Object.keys(preCanon).length) {
                 <iframe
                   ref={iframeRef}
                   src="about:blank"
-                  className="w-[80%] h-[80%] max-w-full max-h-full border-none"
+                  className="w-[min(900px,95vw)] h-[min(80vh,85svh)] max-w-full max-h-full border-none"
                 />
               )}
             </div>

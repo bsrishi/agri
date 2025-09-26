@@ -142,13 +142,62 @@ app.options("*", cors({
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 app.use(express.json());
+// Accept urlencoded form bodies (for FormData etc)
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // -------------------- postgres --------------------
-const pool = new Pool(
+const basePgCfg = (
   DATABASE_URL
     ? { connectionString: DATABASE_URL }
     : { host: PGHOST, port: PGPORT, database: PGDATABASE, user: PGUSER, password: PGPASSWORD }
-);
+) as any;
+
+const pool = new Pool({
+  ...basePgCfg,
+  max: Math.max(10, Number(process.env.PGPOOL_MAX || 20)),
+  idleTimeoutMillis: Number(process.env.PG_IDLE_TIMEOUT_MS || 30_000),
+  connectionTimeoutMillis: Number(process.env.PG_CONN_TIMEOUT_MS || 10_000),
+  keepAlive: true,
+  keepAliveInitialDelayMillis: Number(process.env.PG_KEEPALIVE_DELAY_MS || 10_000),
+  allowExitOnIdle: false,
+});
+
+// Prevent crashes on intermittent network errors with the DB
+pool.on('error', (err: any) => {
+  console.error('[pg] idle client error:', err?.message || err);
+});
+
+// Tiny retry helper for PG queries
+async function pgQueryRetry<T = any>(text: string, params?: any[], attempts = 2): Promise<{ rows: T[]; rowCount: number }>{
+  let lastErr: any;
+  for (let i = 0; i < Math.max(1, attempts); i++) {
+    try {
+      const r = await pool.query(text, params as any);
+      return { rows: r.rows as T[], rowCount: r.rowCount ?? (r.rows?.length || 0) };
+    } catch (e: any) {
+      lastErr = e;
+      const msg = String(e?.message || '').toLowerCase();
+      const code = String(e?.code || '').toUpperCase();
+      // Retry on common transient conditions
+      const transient = msg.includes('timeout') || msg.includes('terminated') || code === 'ETIMEDOUT';
+      if (!transient || i === attempts - 1) break;
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+  throw lastErr;
+}
+
+async function tableExists(schema: string, table: string): Promise<boolean> {
+  try {
+    const q = await pool.query(
+      `select 1 from information_schema.tables where table_schema = $1 and table_name = $2 limit 1`,
+      [schema, table]
+    );
+    return q.rowCount === 1;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Minimal users table (PostgreSQL)
@@ -189,6 +238,12 @@ function normalizePhoneE164(input: string): string {
   // keep last 10 digits; drop leading +91/91/0
   return digits.replace(/^\+?91/, "").replace(/^0/, "").slice(-10);
 }
+
+function normalizeMobile10Strict(x: string | null | undefined): string | null {
+  const d = String(x || '').replace(/\D/g, '');
+  if (d.length < 10) return null;
+  return d.slice(-10);
+}
 function toChatId(phone10: string) {
   return `91${phone10}@c.us`;
 }
@@ -199,6 +254,14 @@ function genOtp() {
 }
 function hash(phone10: string, code: string) {
   return crypto.createHmac("sha256", OTP_SECRET).update(`${phone10}:${code}`).digest("hex");
+}
+function slugifyJobName(name: string): string {
+  return name
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[^A-Za-z0-9._ -]/g, '')
+    .replace(/\s+/g, '-')
+    .slice(0, 120);
 }
 
 /**
@@ -292,6 +355,70 @@ function parseStatusDateToISO(raw?: string | null): string | null {
   return null;
 }
 
+// --- Helpers to parse applied_date and compute 7-year eligibility ---
+function parseAppliedDateToUTC(raw?: string | null): Date | null {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  let m = s.match(/^(\d{2})-(\d{2})-(\d{4})$/); // DD-MM-YYYY
+  if (m) return new Date(Date.UTC(+m[3], +m[2]-1, +m[1]));
+  m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);      // YYYY-MM-DD
+  if (m) return new Date(Date.UTC(+m[1], +m[2]-1, +m[3]));
+  m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);  // DD/MM/YYYY
+  if (m) return new Date(Date.UTC(+m[3], +m[2]-1, +m[1]));
+  m = s.match(/^(\d{4})\/(\d{2})\/(\d{2})$/);  // YYYY/MM/DD
+  if (m) return new Date(Date.UTC(+m[1], +m[2]-1, +m[3]));
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  return null;
+}
+
+function computeSevenYearEligibility(appliedUTC: Date | null) {
+  if (!appliedUTC) return { applied_dt: null as string | null, age_days: null as number | null, next_due: null as string | null, days_remaining: null as number | null, eligible: null as boolean | null };
+  const now = new Date();
+  const todayUTC = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+  const dayMs = 24 * 60 * 60 * 1000;
+  const age_days = Math.floor((todayUTC.getTime() - appliedUTC.getTime()) / dayMs);
+  const next_due = new Date(appliedUTC.getTime());
+  next_due.setUTCFullYear(next_due.getUTCFullYear() + 7);
+  const rem = Math.ceil((next_due.getTime() - todayUTC.getTime()) / dayMs);
+  const days_remaining = Math.max(0, rem);
+  const eligible = days_remaining === 0;
+  const fmt = (d: Date) => d.toISOString().slice(0, 10);
+  return { applied_dt: fmt(appliedUTC), age_days, next_due: fmt(next_due), days_remaining, eligible };
+}
+
+// --- Utility to enrich application rows with eligibility and surveys ---
+async function enrichApplicationsWithEligibility(apps: (AppRow & { has_statuses?: boolean })[]) {
+  if (!Array.isArray(apps) || !apps.length) return apps;
+  const ids = apps.map(a => a.application_id);
+  const svyMap = new Map<string, { survey_no: string | null, subdivision_no: string | null }[]>();
+  try {
+    const { rows } = await pool.query(
+      `select application_id, survey_no, subdivision_no from public.application_surveys where application_id = any($1)`,
+      [ids]
+    );
+    for (const r of rows as any[]) {
+      const arr = svyMap.get(r.application_id) || [];
+      arr.push({ survey_no: r.survey_no ?? null, subdivision_no: r.subdivision_no ?? null });
+      svyMap.set(r.application_id, arr);
+    }
+  } catch {}
+
+  return apps.map(a => {
+    const appliedUTC = parseAppliedDateToUTC(a.applied_date);
+    const elig = computeSevenYearEligibility(appliedUTC);
+    const surveys = (svyMap.get(a.application_id) || []).map(s => ({
+      survey_no: s.survey_no,
+      subdivision_no: s.subdivision_no,
+      completed_on: elig.applied_dt,
+      next_due: elig.next_due,
+      days_remaining: elig.days_remaining,
+      eligible: elig.eligible,
+    }));
+    return { ...a, eligibility: elig, surveys } as any;
+  });
+}
+
 /* -------------------- in-memory store -------------------- */
 type StoreEntry = { hash: string; expiresAt: number; tries: number };
 const store = new Map<string, StoreEntry>(); // key = phone10
@@ -321,6 +448,9 @@ async function tnPost(path: string, payload: any, referer: string) {
   } catch (err: any) {
     const status = err?.response?.status;
     console.warn(`[tnPost] ${TN_BASE}${path} failed${status ? ` (status ${status})` : ""}:`, err?.message || err);
+    if (DEBUG_TN) {
+      console.warn('[tnPost] payload was:', JSON.stringify(payload));
+    }
     return {};
   }
 }
@@ -346,6 +476,16 @@ type AppRow = {
 };
 
 type StatusRow = { status_date?: string | null; status?: string; remarks?: string; components?: string; name?: string };
+
+// --- Shared completeness helper for app rows ---
+const REQUIRED_FIELDS_KEYS: Array<keyof AppRow> = [
+  'crop_type', 'mi_name', 'applied_date', 'farmer_name', 'mi_area', 'total_area',
+  'survey_no', 'subdivision_no', 'farmer_type', 'ss'
+];
+function isAppComplete(a: Partial<AppRow> | AppRow | null | undefined): boolean {
+  if (!a) return false;
+  return REQUIRED_FIELDS_KEYS.every(k => (a as any)[k] != null && String((a as any)[k]).trim() !== '');
+}
 
 /* ---------------- DB helpers (Postgres) ---------------- */
 async function upsertApplications(rows: (AppRow & { source: string })[]) {
@@ -373,11 +513,11 @@ async function upsertApplications(rows: (AppRow & { source: string })[]) {
         farmer_type = COALESCE(EXCLUDED.farmer_type, applications.farmer_type),
         ss = COALESCE(EXCLUDED.ss, applications.ss),
         source = COALESCE(EXCLUDED.source, applications.source),
-        mobile = COALESCE(applications.mobile, EXCLUDED.mobile),
-        aadhaar = COALESCE(applications.aadhaar, EXCLUDED.aadhaar),
-        district = COALESCE(applications.district, EXCLUDED.district),
-        block    = COALESCE(applications.block, EXCLUDED.block),
-        village  = COALESCE(applications.village, EXCLUDED.village),
+        mobile  = COALESCE(NULLIF(applications.mobile,  ''), EXCLUDED.mobile),
+        aadhaar = COALESCE(NULLIF(applications.aadhaar,''), EXCLUDED.aadhaar),
+        district = COALESCE(NULLIF(applications.district,''), EXCLUDED.district),
+        block    = COALESCE(NULLIF(applications.block,  ''), EXCLUDED.block),
+        village  = COALESCE(NULLIF(applications.village,''), EXCLUDED.village),
         updated_at = now();
     `;
     const values = rows.flatMap(r => [
@@ -439,6 +579,89 @@ async function replaceApplicationSurveys(appId: string, surveyNo?: string | null
   }
 }
 
+// --- granular application_surveys upsert (handles nested survey arrays) ---
+function _svy_s(x: any): string | null {
+  if (x == null) return null;
+  const v = String(x).trim();
+  return v ? v : null;
+}
+
+// Discover once whether application_surveys has geo columns
+let _SURVEY_HAS_GEO: boolean | null = null;
+async function ensureSurveySchema(): Promise<boolean> {
+  if (_SURVEY_HAS_GEO !== null) return _SURVEY_HAS_GEO;
+  try {
+    const q = await pool.query(
+      `select 1 from information_schema.columns
+        where table_schema = 'public' and table_name = 'application_surveys'
+          and column_name in ('district','block','village')
+        limit 1`
+    );
+    _SURVEY_HAS_GEO = !!q.rowCount;
+  } catch {
+    _SURVEY_HAS_GEO = false;
+  }
+  return _SURVEY_HAS_GEO;
+}
+
+async function upsertApplicationSurvey(
+  appId: string,
+  surveyNo: string | null,
+  subDivNo: string | null,
+  district?: string | null,
+  block?: string | null,
+  village?: string | null
+) {
+  if (!appId) return;
+  const hasGeo = await ensureSurveySchema();
+  if (hasGeo) {
+    await pool.query(
+      `insert into public.application_surveys (application_id, survey_no, subdivision_no, district, block, village)
+       values ($1,$2,$3,$4,$5,$6)
+       on conflict (application_id, survey_no, subdivision_no) do update set
+         district = excluded.district,
+         block    = excluded.block,
+         village  = excluded.village`,
+      [appId, _svy_s(surveyNo), _svy_s(subDivNo), _svy_s(district), _svy_s(block), _svy_s(village)]
+    );
+  } else {
+    // Legacy 3-column table – ignore geo silently
+    await pool.query(
+      `insert into public.application_surveys (application_id, survey_no, subdivision_no)
+       values ($1,$2,$3)
+       on conflict (application_id, survey_no, subdivision_no) do nothing`,
+      [appId, _svy_s(surveyNo), _svy_s(subDivNo)]
+    );
+  }
+}
+
+function extractSurveyTuplesFromApp(app: any) {
+  const appId   = _svy_s(app?.application_id || app?.appId || app?.applicationId || app?.id);
+  if (!appId) return [] as any[];
+  const district = _svy_s(app?.district || app?.dist || app?.district_name || app?.districtName);
+  const block    = _svy_s(app?.block || app?.block_name || app?.blockName || app?.taluk);
+  const village  = _svy_s(app?.village || app?.village_name || app?.villageName);
+  const surveyNo = _svy_s(app?.survey_no || app?.survey || app?.survey_number);
+  const subDivNo = _svy_s(app?.subdivision_no || app?.sub_division_no || app?.subdivision || app?.sub_div_no);
+
+  const tuples: { appId: string, survey_no: string | null, subdivision_no: string | null, district: string | null, block: string | null, village: string | null }[] = [];
+  const lists: any[] = [];
+  if (Array.isArray(app?.surveys)) lists.push(...app.surveys);
+  if (Array.isArray(app?.survey_list)) lists.push(...app.survey_list);
+  if (Array.isArray(app?.application_surveys)) lists.push(...app.application_surveys);
+
+  if (lists.length) {
+    for (const s of lists) {
+      const sNo  = _svy_s(s?.survey_no || s?.survey || s?.survey_number) || surveyNo;
+      const sdNo = _svy_s(s?.subdivision_no || s?.sub_division_no || s?.subdivision) || subDivNo;
+      tuples.push({ appId, survey_no: sNo || null, subdivision_no: sdNo || null, district, block, village });
+    }
+  } else {
+    tuples.push({ appId, survey_no: surveyNo, subdivision_no: subDivNo, district, block, village });
+  }
+  return tuples;
+}
+
 // Write-through cache: persist application rows, surveys, statuses, and print meta
 async function persistAppsSurveysStatusesMeta(apps: (AppRow & { source?: string })[]): Promise<void> {
   if (!Array.isArray(apps) || apps.length === 0) return;
@@ -496,11 +719,51 @@ async function getApplicationsByNumber(number: string) {
            a.mi_area, a.total_area, a.survey_no, a.subdivision_no, a.farmer_type, a.ss,
            a.mobile, a.aadhaar, a.district, a.block, a.village,
            EXISTS (SELECT 1 FROM statuses s WHERE s.application_id = a.application_id) AS has_statuses
-    FROM applications a
-    WHERE ${isAadhaar ? "a.aadhaar = $1" : "a.mobile = $1"}
-    ORDER BY a.updated_at DESC
+      FROM applications a
+     WHERE ${
+       isAadhaar
+         ? "RIGHT(regexp_replace(COALESCE(a.aadhaar,''), '[^0-9]', '', 'g'), 12) = $1"
+         : "RIGHT(regexp_replace(COALESCE(a.mobile,''),  '[^0-9]', '', 'g'), 10) = $1"
+     }
+     ORDER BY a.updated_at DESC
   `;
   const { rows } = await pool.query(sql, [number]);
+  return rows as (AppRow & { has_statuses: boolean })[];
+}
+
+// Helper: fetch applications by number WITHIN days window based on applied_date
+async function getApplicationsByNumberWithinDays(number: string, days: number) {
+  const isAadhaar = number.length === 12;
+  const sql = `
+    WITH base AS (
+      SELECT 
+        a.application_id, a.crop_type, a.mi_name, a.applied_date, a.farmer_name,
+        a.mi_area, a.total_area, a.survey_no, a.subdivision_no, a.farmer_type, a.ss,
+        a.mobile, a.aadhaar, a.district, a.block, a.village,
+        CASE 
+          WHEN a.applied_date ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$' THEN to_date(a.applied_date,'DD-MM-YYYY')
+          WHEN a.applied_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' THEN to_date(a.applied_date,'YYYY-MM-DD')
+          WHEN a.applied_date ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$' THEN to_date(a.applied_date,'DD/MM/YYYY')
+          WHEN a.applied_date ~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$' THEN to_date(a.applied_date,'YYYY/MM/DD')
+          ELSE NULL
+        END AS applied_dt
+      FROM applications a
+      WHERE ${
+        isAadhaar
+          ? "RIGHT(regexp_replace(COALESCE(a.aadhaar,''), '[^0-9]', '', 'g'), 12) = $1"
+          : "RIGHT(regexp_replace(COALESCE(a.mobile,''),  '[^0-9]', '', 'g'), 10) = $1"
+      }
+    )
+    SELECT 
+      b.application_id, b.crop_type, b.mi_name, b.applied_date, b.farmer_name,
+      b.mi_area, b.total_area, b.survey_no, b.subdivision_no, b.farmer_type, b.ss,
+      b.mobile, b.aadhaar, b.district, b.block, b.village,
+      EXISTS (SELECT 1 FROM statuses s WHERE s.application_id = b.application_id) AS has_statuses
+    FROM base b
+    WHERE b.applied_dt IS NOT NULL AND (current_date - b.applied_dt)::int BETWEEN 0 AND $2
+    ORDER BY b.applied_dt DESC NULLS LAST, b.application_id DESC
+  `;
+  const { rows } = await pool.query(sql, [number, days]);
   return rows as (AppRow & { has_statuses: boolean })[];
 }
 
@@ -551,7 +814,7 @@ async function fetchAppsByNumberFromTN(number: string) {
   const payload = { xformVars: [{ name: "txtSearchAadhar", value: number }] };
 
   const candidates = [
-    "/HttpServiceLogin/get_search_application_status_by_aadhar",  // single 'a' (observed fallback)
+    "/HttpServiceLogin/get_search_application_status_by_aadhar"
   ];
 
   let rows: any[] = [];
@@ -564,25 +827,62 @@ async function fetchAppsByNumberFromTN(number: string) {
 
   if (!rows.length) return [];
 
-  const mapped = rows.map((t: any) => ({
-    application_id: t.application_id,
-    crop_type: t.crop_type,
-    mi_name: t.mi_name,
-    applied_date: t.applied_date,
-    farmer_name: t.farmer_name,
-    mi_area: t.mi_area ?? null,
-    total_area: t.total_area ?? null,
-    survey_no: t.survey_no,
-    subdivision_no: t.subdivision_no,
-    farmer_type: t.farmer_type,
-    ss: t.ss,
-    source: "number",
-    mobile: isAadhaar ? null : number,
-    aadhaar: isAadhaar ? number : null,
-    district: null,
-    block: null,
-    village: null,
-  })) as (AppRow & { source: string })[];
+  const mapped = rows.map((t: any) => {
+    const BLANKS = new Set(["", " ", "null", "NULL", "na", "NA", "n/a", "N/A", "-", "--"]);
+    const clean = (v: any): any => {
+      if (v == null) return null;
+      const s = String(v).trim();
+      if (BLANKS.has(s)) return null;
+      return s;
+    };
+    const get = (v: any, ...alts: any[]) => {
+      const first = clean(v);
+      if (first != null) return first;
+      for (const a of alts) {
+        const c = clean(a);
+        if (c != null) return c;
+      }
+      return null;
+    };
+    const toNum = (x: any) => {
+      const s = clean(x);
+      if (s == null) return null;
+      const n = Number(String(s).replace(/,/g, ""));
+      return Number.isFinite(n) ? n : null;
+    };
+
+    const application_id = String(get(t.application_id, t.appId, t.id) ?? "").trim();
+    const crop_type      = get(t.crop_type, t.crop_name, t.cropType);
+    const mi_name        = get(t.mi_name, t.company_name, t.miName);
+    const applied_date   = get(t.applied_date, t.appliedDate);
+    const farmer_name    = get(t.farmer_name, t.applicant_name, t.applicantName, t.farmer);
+    const mi_area_raw    = get(t.mi_area, t.mi_hectare, t.mi, t.miarea);
+    const total_area_raw = get(t.total_area, t.total_hectare, t.hectare, t.area);
+    const survey_no      = get(t.survey_no, t.survey, t.survey_number);
+    const subdivision_no = get(t.subdivision_no, t.sub_division_no, t.subdivision);
+    const farmer_type    = get(t.farmer_type, t.farmerType);
+    const ss             = get(t.ss, t.status_summary, t.latest_status);
+
+    return {
+      application_id,
+      crop_type:    crop_type ?? null,
+      mi_name:      mi_name ?? null,
+      applied_date: applied_date ?? null,
+      farmer_name:  farmer_name ?? null,
+      mi_area:      toNum(mi_area_raw),
+      total_area:   toNum(total_area_raw),
+      survey_no:    survey_no ?? null,
+      subdivision_no: subdivision_no ?? null,
+      farmer_type:  farmer_type ?? null,
+      ss:           ss ?? null,
+      source: "number",
+      mobile:  isAadhaar ? null   : number,
+      aadhaar: isAadhaar ? number : null,
+      district: null,
+      block: null,
+      village: null,
+    } as AppRow & { source: string };
+  });
 
   // NOTE: Do not upsert application_surveys here — caller upserts *after* upserting applications to satisfy FK.
 
@@ -677,34 +977,597 @@ async function fetchAndStorePrintMeta(appId: string): Promise<{ district?: strin
 async function fetchAndStoreStatuses(appId: string) {
   if (DEBUG_TN) console.log(`[fetchAndStoreStatuses] appId=${appId}`);
   let items: StatusRow[] = [];
-  try {
-    const inner = await tnPost(
-      "/HttpServiceLogin/get_search_application_status",
-      { xformVars: [{ name: "txtSearchAppId", value: appId }, { name: "StatusType", value: "1" }] },
-      "/Subsidy/TrackApplication"
-    );
-    const table: any[] = Array.isArray((inner as any)?.Table) ? (inner as any).Table : [];
-    items = table.map(r => ({
-      status_date: parseStatusDateToISO(r.status_date) ?? null, // ← ensure type matches (string | null)
+
+  // PRIMARY (as requested): exact endpoint
+  const primary = "/HttpServiceLogin/get_search_application_status";
+  const referer = "/Subsidy/TrackApplication";
+  const basePayload = { xformVars: [{ name: "txtSearchAppId", value: appId }, { name: "StatusType", value: "1" }] };
+
+  // Fallbacks kept for resilience
+  const fallbacks = [
+    { path: "/HttpServiceLogin/get_search_application_status", payload: { xformVars: [{ name: "txtSearchAppId", value: appId }] } },
+    { path: "/HttpServiceLogin/get_search_application_status_by_appid", payload: basePayload },
+    { path: "/HttpServiceLogin/get_search_application_status_by_applicationid", payload: basePayload },
+    { path: "/HttpServiceLogin/get_application_status_by_appid", payload: basePayload },
+  ];
+
+  // small retry helper
+  const tryOnce = async (path: string, payload: any) => {
+    // first attempt
+    let inner = await tnPost(path, payload, referer);
+    let table = Array.isArray((inner as any)?.Table) ? (inner as any).Table : [];
+    if (table.length) return table;
+    // quick retry (handles transient 5xx)
+    await new Promise(r => setTimeout(r, 400));
+    inner = await tnPost(path, payload, referer);
+    table = Array.isArray((inner as any)?.Table) ? (inner as any).Table : [];
+    return table;
+  };
+
+  let table: any[] = [];
+  // Primary first
+  table = await tryOnce(primary, basePayload);
+
+  // Fallbacks only if needed
+  if (!table.length) {
+    for (const fb of fallbacks) {
+      table = await tryOnce(fb.path, fb.payload);
+      if (DEBUG_TN) console.log(`[fetchAndStoreStatuses] tried ${fb.path} -> ${table.length} rows`);
+      if (table.length) break;
+    }
+  }
+
+  if (table.length) {
+    items = table.map((r: any) => ({
+      status_date: parseStatusDateToISO(r.status_date) ?? null,
       status: r.status,
       remarks: r.remarks,
       components: r.components,
       name: r.name,
     }));
-  } catch (e: any) {
-    console.warn(`[fetchAndStoreStatuses] appId=${appId} failed:`, e?.message || e);
+  } else {
     items = [];
   }
-  await upsertApplications([
-    { application_id: appId, source: "application", ss: items?.[0]?.status ?? null, mobile: null, aadhaar: null } as any,
-  ]);
-  await replaceStatuses(appId, items);
-  // Also refresh surveys if we later attach them elsewhere (no-op here).
+
+  // Only persist when we actually have timeline rows from TN
+  if (items.length > 0) {
+    await upsertApplications([
+      { application_id: appId, source: "application", ss: items?.[0]?.status ?? null, mobile: null, aadhaar: null } as any,
+    ]);
+    await replaceStatuses(appId, items);
+  } else {
+    // No data from TN → do not create placeholder application rows
+    if (DEBUG_TN) console.log(`[fetchAndStoreStatuses] no rows for ${appId} — skipping persistence`);
+  }
+
   return items;
 }
 
+// Global helper: check if a column exists on a table (schema.table or table)
+async function pgColumnExists(tbl: string, col: string): Promise<boolean> {
+  try {
+    const schema = tbl.includes('.') ? tbl.split('.')[0] : 'public';
+    const table  = tbl.includes('.') ? tbl.split('.')[1] : tbl;
+    const q = await pool.query(
+      `select 1 from information_schema.columns where table_schema = $1 and table_name = $2 and column_name = $3 limit 1`,
+      [schema, table, col]
+    );
+    return q.rowCount === 1;
+  } catch {
+    return false;
+  }
+}
+
+
+// Build a timeframe predicate using whichever timestamp columns exist on the table
+async function buildDateWindowPredicate(table: string, alias: string, days: number, prefix: 'WHERE'|'AND'): Promise<string> {
+  const candidates: string[] = ['updated_at','created_at','inserted_at','ts'];
+  const present: string[] = [];
+  for (const c of candidates) {
+    if (await pgColumnExists(table, c)) present.push(`${alias}.${c}`);
+  }
+  if (!present.length) return '';
+  if (present.length === 1) {
+    return `${prefix} ${present[0]} >= now() - interval '${days} days'`;
+  }
+  // Use COALESCE over existing columns for robust gating
+  return `${prefix} coalesce(${present.join(', ')}) >= now() - interval '${days} days'`;
+}
+
 /* -------------------- routes -------------------- */
+
 app.get("/health", (_req: Request, res: Response) => res.json({ ok: true }));
+
+// ---- Dashboard Overview (aggregated metrics for UI) ----
+app.get("/api/dashboard/overview", async (_req: Request, res: Response) => {
+  try {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+
+    // 1) Scalar metrics
+    const scalarsSql = `
+      with
+      farmers as (
+        select count(distinct right(regexp_replace(coalesce(mobile,''), '[^0-9]', '', 'g'), 10)) as n
+        from public.applications
+        where coalesce(mobile,'') <> ''
+      ),
+      apps as (
+        select count(*) as n from public.applications
+      ),
+      d as (
+        select count(distinct district) as n from public.applications where district is not null and district <> ''
+      ),
+      b as (
+        select count(distinct block) as n from public.applications where block is not null and block <> ''
+      ),
+      v as (
+        select count(distinct village) as n from public.applications where village is not null and village <> ''
+      ),
+      with_statuses as (
+        select count(distinct application_id) as n from public.statuses
+      ),
+      jobs_run as (
+        select count(*) as n from public.bulk_jobs where lower(status) = 'running'
+      ),
+      jobs_q as (
+        select count(*) as n from public.bulk_jobs where lower(status) = 'queued'
+      )
+      select
+        (select n from farmers)        as farmers,
+        (select n from apps)           as applications,
+        (select n from d)              as districts,
+        (select n from b)              as blocks,
+        (select n from v)              as villages,
+        (select n from with_statuses)  as with_statuses,
+        (select n from jobs_run)       as jobs_running,
+        (select n from jobs_q)         as jobs_queued
+    `;
+
+    const scal = await pool.query(scalarsSql);
+    const S = scal.rows?.[0] || {};
+
+    // Compute last_sync safely without assuming created_at/updated_at exist
+    async function getMaxTsSafe(table: string, cols: string[]): Promise<Date | null> {
+      for (const c of cols) {
+        try {
+          const q = await pool.query(`select max(${c}) as ts from ${table}`);
+          const v = q.rows?.[0]?.ts;
+          if (v) return new Date(v);
+        } catch (_) { /* column may not exist – try next */ }
+      }
+      return null;
+    }
+    const appTs = await getMaxTsSafe('public.applications', ['updated_at','created_at','ts','inserted_at']);
+    const stTs  = await getMaxTsSafe('public.statuses',    ['updated_at','created_at','ts','inserted_at']);
+    const lastSync = appTs && stTs ? (appTs > stTs ? appTs : stTs) : (appTs || stTs);
+
+    // 2) Top geo lists (number of distinct applications per geography)
+    const topDistrictsSql = `
+      select a.district as name, count(distinct a.application_id)::int as count
+      from public.applications a
+      where a.district is not null and a.district <> ''
+      group by a.district
+      order by count desc nulls last, name asc`;
+
+    const topBlocksSql = `
+      select a.block as name, count(distinct a.application_id)::int as count
+      from public.applications a
+      where a.block is not null and a.block <> ''
+      group by a.block
+      order by count desc nulls last, name asc`;
+
+    const topVillagesSql = `
+      select a.village as name, count(distinct a.application_id)::int as count
+      from public.applications a
+      where a.village is not null and a.village <> ''
+      group by a.village
+      order by count desc nulls last, name asc`;
+
+    const [dRows, bRows, vRows] = await Promise.all([
+      pool.query(topDistrictsSql),
+      pool.query(topBlocksSql),
+      pool.query(topVillagesSql),
+    ]);
+
+    return res.json({
+      ok: true,
+      farmers: Number(S.farmers || 0),
+      applications: Number(S.applications || 0),
+      districts: Number(S.districts || 0),
+      blocks: Number(S.blocks || 0),
+      villages: Number(S.villages || 0),
+      with_statuses: Number(S.with_statuses || 0),
+      jobs_running: Number(S.jobs_running || 0),
+      jobs_queued: Number(S.jobs_queued || 0),
+      last_sync: lastSync ? lastSync.toISOString() : null,
+      top_districts: (dRows.rows || []).map(r => ({ name: r.name, count: Number(r.count || 0) })),
+      top_blocks:    (bRows.rows || []).map(r => ({ name: r.name, count: Number(r.count || 0) })),
+      top_villages:  (vRows.rows || []).map(r => ({ name: r.name, count: Number(r.count || 0) })),
+    });
+  } catch (e: any) {
+    console.error("/api/dashboard/overview error:", e?.message || e);
+    return res.status(500).json({ ok: false, message: e?.message || "Failed to load overview" });
+  }
+});
+
+// ---- Dashboard Fraud: same customer across multiple geographies ----
+app.get("/api/dashboard/fraud", async (_req: Request, res: Response) => {
+  try {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+
+    const sql = `
+      with base as (
+        select
+          a.application_id,
+          right(regexp_replace(coalesce(a.mobile, ''),  '[^0-9]', '', 'g'), 10) as m10,
+          right(regexp_replace(coalesce(a.aadhaar, ''), '[^0-9]', '', 'g'), 12) as a12,
+          a.district, a.block, a.village
+        from public.applications a
+      ),
+      keyed as (
+        select
+          application_id,
+          nullif(m10, '') as m10,
+          nullif(a12, '') as a12,
+          district, block, village,
+          coalesce(nullif(m10, ''), concat('aad:', nullif(a12, ''))) as ck
+        from base
+        where (nullif(m10, '') is not null) or (nullif(a12, '') is not null)
+      ),
+      agg as (
+        select
+          ck,
+          count(distinct application_id)                                 as applications,
+          array_agg(distinct application_id)                             as application_ids,
+          array_remove(array_agg(distinct coalesce(district, '')), '')   as districts,
+          array_remove(array_agg(distinct coalesce(block, '')), '')      as blocks,
+          array_remove(array_agg(distinct coalesce(village, '')), '')    as villages,
+          max(m10)                                                       as mobile,
+          max(a12)                                                       as aadhaar
+        from keyed
+        group by ck
+      )
+      select
+        ck as customer_key,
+        mobile,
+        aadhaar,
+        applications::int,
+        application_ids,
+        districts,
+        blocks,
+        villages
+      from agg
+      where cardinality(districts) > 1
+         or cardinality(blocks)    > 1
+         or cardinality(villages)  > 1
+      order by applications desc, mobile nulls last, aadhaar nulls last;
+    `;
+
+    const { rows } = await pool.query(sql);
+    return res.json({ ok: true, rows });
+  } catch (e: any) {
+    console.error("/api/dashboard/fraud error:", e?.message || e);
+    return res.status(500).json({ ok: false, message: e?.message || "Failed to load fraud data" });
+  }
+});
+
+// ---- Dashboard Leads (safe alias) ----
+// Some clients call /api/dashboard/leads without the sub-path; delegate to /by-geo and never 404
+app.get("/api/dashboard/leads", (req: Request, res: Response) => {
+  // Preserve original query string when delegating to /by-geo
+  const urlStr = String(req.url || "");
+  const qIndex = urlStr.indexOf("?");
+  const search = qIndex >= 0 ? urlStr.slice(qIndex) : "";
+  const fwdUrl = "/api/dashboard/leads/by-geo" + search;
+
+  // Create a proxy request that inherits from the original, but with a new URL
+  const proxyReq: any = Object.create(req);
+  proxyReq.url = fwdUrl;
+  proxyReq.method = "GET";
+
+  (app as any)._router.handle(proxyReq, res, () => {
+    // Fallback: return empty payload instead of 404/500 (keeps caller happy)
+    try {
+      const level = String((req.query as any)?.level || 'district').toLowerCase();
+      return res.json({ ok: true, level, rows: [] });
+    } catch {
+      return res.json({ ok: true, level: 'district', rows: [] });
+    }
+  });
+});
+// ---- Dashboard Leads (Geo Aggregation): potential leads across geographies ----
+app.get("/api/dashboard/leads/by-geo", async (req: Request, res: Response) => {
+  try {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    const q: any = req.query || {};
+    const level = String(q.level || 'district').toLowerCase();
+    if (!['district','block','village'].includes(level)) {
+      return res.status(400).json({ ok: false, message: "level must be one of district|block|village" });
+    }
+
+    const district = String(q.district || '').trim();
+    const block    = String(q.block || '').trim();
+    const village  = String(q.village || '').trim();
+
+    const geoConds: string[] = [];
+    const params: any[] = [];
+    if (district) { params.push(district); geoConds.push(`a.district = $${params.length}`); }
+    if (block)    { params.push(block);    geoConds.push(`a.block = $${params.length}`); }
+    if (village)  { params.push(village);  geoConds.push(`a.village = $${params.length}`); }
+    const geoSql = geoConds.length ? ` AND ${geoConds.join(' AND ')}` : '';
+
+    // Optional: filter by 7-year eligibility within N days
+    const dnum = Number((q as any).days);
+    const daysFilter: number | null = Number.isFinite(dnum) && dnum >= 0 ? Math.floor(dnum) : null;
+    if (daysFilter !== null) res.setHeader("x-sla-days", String(daysFilter));
+
+    const sql = `
+      with app_base as (
+        select 
+          a.application_id,
+          right(regexp_replace(coalesce(a.mobile,''),'[^0-9]','','g'),10) as m10,
+          trim(a.${level}) as geo,
+          a.total_area,
+          a.mi_area,
+          case 
+            when a.applied_date ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$' then to_date(a.applied_date,'DD-MM-YYYY')
+            when a.applied_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' then to_date(a.applied_date,'YYYY-MM-DD')
+            when a.applied_date ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$' then to_date(a.applied_date,'DD/MM/YYYY')
+            when a.applied_date ~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$' then to_date(a.applied_date,'YYYY/MM/DD')
+            else null
+          end as applied_dt
+        from public.applications a
+        where 1=1
+        ${geoSql}
+      ), elig as (
+        select *, case when applied_dt is null then null else greatest(0, ((applied_dt + interval '7 years')::date - current_date)) end as days_remaining
+        from app_base
+      ), filtered as (
+        select * from ${daysFilter !== null ? 'elig' : 'app_base'}
+        ${daysFilter !== null ? 'where applied_dt is null or days_remaining = 0 or days_remaining <= $DAYS$' : ''}
+      ), mob as (
+        select geo, count(distinct m10)::int as mobiles
+        from filtered
+        where m10 ~ '^[6-9][0-9]{9}$'
+        group by geo
+      )
+      select 
+        coalesce(f.geo,'') as name,
+        count(distinct f.application_id)::int as applications,
+        coalesce(m.mobiles,0)::int as mobiles,
+        sum(coalesce(f.total_area,0))::float as total_area,
+        sum(coalesce(f.mi_area,0))::float as mi_area
+      from filtered f
+      left join mob m on m.geo = f.geo
+      group by f.geo, m.mobiles
+      order by applications desc nulls last, name asc
+    `;
+
+    let finalSql = sql;
+    const finalParams: any[] = [...params];
+    if (daysFilter !== null) {
+      const idx = finalParams.length + 1;
+      // Replace ALL $DAYS$ occurrences globally
+      finalSql = finalSql.replace(/\$DAYS\$/g, `$${idx}`);
+      finalParams.push(daysFilter);
+    } else {
+      // Replace ALL $DAYS$ occurrences globally with 0 (safe default)
+      finalSql = finalSql.replace(/\$DAYS\$/g, `0`);
+    }
+    const { rows } = await pool.query(finalSql, finalParams);
+    return res.json({ ok: true, level, rows, ...(daysFilter !== null ? { days: daysFilter } : {}) });
+  } catch (e: any) {
+    console.error('/api/dashboard/leads/by-geo error:', e?.message || e);
+    return res.status(500).json({ ok: false, message: e?.message || 'Failed to load leads geo' });
+  }
+});
+
+// ---- Dashboard Leads (Geo Drilldown): list mobiles + hectares in a given geo ----
+app.get("/api/dashboard/leads/list", async (req: Request, res: Response) => {
+  try {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    const q: any = req.query || {};
+    const level = String(q.level || 'district').toLowerCase();
+    const name  = String(q.name || '').trim();
+    if (!['district','block','village'].includes(level)) {
+      return res.status(400).json({ ok: false, message: "level must be one of district|block|village" });
+    }
+    if (!name) return res.json({ ok: true, level, name: '', rows: [] });
+
+    const district = String(q.district || '').trim();
+    const block    = String(q.block || '').trim();
+    const village  = String(q.village || '').trim();
+
+    const params: any[] = [name];
+    const extraConds: string[] = [];
+    if (level !== 'district' && district) { params.push(district); extraConds.push(`a.district = $${params.length}`); }
+    if (level !== 'block'    && block)    { params.push(block);    extraConds.push(`a.block = $${params.length}`); }
+    if (level !== 'village'  && village)  { params.push(village);  extraConds.push(`a.village = $${params.length}`); }
+    const extraSql = extraConds.length ? ` AND ${extraConds.join(' AND ')}` : '';
+
+    // Optional days filter for 7-year eligibility (read from query or Referer)
+    let daysFilter: number | null = null;
+    {
+      const dFromQ = Number((q as any).days);
+      if (Number.isFinite(dFromQ) && dFromQ >= 0) daysFilter = Math.floor(dFromQ);
+      if (daysFilter == null) {
+        const ref = String((req.headers as any)?.referer || (req.headers as any)?.referrer || '');
+        const m = ref.match(/[?&]days=(\d+)/);
+        if (m) {
+          const n = Number(m[1]);
+          if (Number.isFinite(n) && n >= 0) daysFilter = Math.floor(n);
+        }
+      }
+      if (daysFilter !== null) res.setHeader('x-sla-days', String(daysFilter));
+    }
+
+    const sql = `
+      with app_base as (
+        select 
+          a.application_id,
+          right(regexp_replace(coalesce(a.mobile,''),'[^0-9]','','g'),10) as mobile,
+          trim(a.${level}) as geo,
+          a.total_area,
+          a.mi_area,
+          a.farmer_name,
+          case 
+            when a.applied_date ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$' then to_date(a.applied_date,'DD-MM-YYYY')
+            when a.applied_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' then to_date(a.applied_date,'YYYY-MM-DD')
+            when a.applied_date ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$' then to_date(a.applied_date,'DD/MM/YYYY')
+            when a.applied_date ~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$' then to_date(a.applied_date,'YYYY/MM/DD')
+            else null
+          end as applied_dt
+        from public.applications a
+        where lower(trim(a.${level})) = lower(trim($1))
+        ${extraSql}
+      ), elig as (
+        select *,
+               case when applied_dt is null then null else (current_date - applied_dt)::int end as age_days,
+               case when applied_dt is null then null else greatest(0, ((applied_dt + interval '7 years')::date - current_date)) end as days_remaining
+        from app_base
+      ), filtered as (
+        select * from ${daysFilter !== null ? 'elig' : 'app_base'}
+        ${daysFilter !== null ? 'where (applied_dt is null or days_remaining = 0 or days_remaining <= $DAYS$)' : ''}
+      ), per_bucket as (
+        -- Derive a bucket key: valid 10-digit mobile as-is; otherwise one row per application without mobile
+        select 
+          case when mobile ~ '^[6-9][0-9]{9}$' then mobile else concat('no-mobile:', application_id) end as bucket,
+          mobile,
+          application_id,
+          total_area,
+          mi_area,
+          farmer_name,
+          age_days,
+          days_remaining,
+          case when applied_dt is null or days_remaining = 0 or (days_remaining is not null and days_remaining <= $DAYS$) then true else false end as is_eligible
+        from filtered
+      ), agg as (
+        -- Aggregate by bucket. For valid mobiles we collapse to one row; for no-mobile we keep one row per app.
+        select 
+          max(case when bucket like 'no-mobile:%' then null else bucket end) as mobile,
+          count(distinct application_id)::int as applications,
+          sum(coalesce(total_area,0))::float as total_area,
+          sum(coalesce(mi_area,0))::float as mi_area,
+          array_remove(array_agg(distinct coalesce(farmer_name,'')), '') as farmer_names,
+          array_agg(distinct application_id) as application_ids,
+          ${daysFilter !== null ? `array_agg(age_days order by application_id) as application_age_days,
+          array_agg(days_remaining order by application_id) as application_days_remaining` : `array[]::int[] as application_age_days,
+          array[]::int[] as application_days_remaining`},
+          bool_or(is_eligible) as eligible_any
+        from per_bucket
+        group by bucket
+      )
+      select * from agg
+      order by applications desc, total_area desc, coalesce(mobile, '') asc
+    `;
+
+    let finalSql = sql;
+    const finalParams: any[] = [...params];
+    if (daysFilter !== null) {
+      const idx = finalParams.length + 1;
+      // Replace ALL $DAYS$ occurrences globally
+      finalSql = finalSql.replace(/\$DAYS\$/g, `$${idx}`);
+      finalParams.push(daysFilter);
+    } else {
+      // Replace ALL $DAYS$ occurrences globally with 0 (safe default)
+      finalSql = finalSql.replace(/\$DAYS\$/g, `0`);
+    }
+    const { rows } = await pool.query(finalSql, finalParams);
+    return res.json({ ok: true, level, name, rows, ...(daysFilter !== null ? { days: daysFilter } : {}) });
+  } catch (e: any) {
+    console.error('/api/dashboard/leads/list error:', e?.message || e);
+    return res.status(500).json({ ok: false, message: e?.message || 'Failed to load leads list' });
+  }
+});
+
+// ---- Dashboard Leads (Filters): lists for District / Block / Village within timeframe ----
+app.get("/api/dashboard/leads/filters", async (req: Request, res: Response) => {
+  try {
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    const q: any = req.query || {};
+    const dnum = Number(q.days);
+    const days: number | null = Number.isFinite(dnum) && dnum >= 0 ? Math.floor(dnum) : null;
+    const district = String(q.district || '').trim();
+    const block    = String(q.block || '').trim();
+
+    const base = `with raw as (
+      select a.district, a.block, a.village,
+        case 
+          when a.applied_date ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}$' then to_date(a.applied_date,'DD-MM-YYYY')
+          when a.applied_date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' then to_date(a.applied_date,'YYYY-MM-DD')
+          when a.applied_date ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$' then to_date(a.applied_date,'DD/MM/YYYY')
+          when a.applied_date ~ '^[0-9]{4}/[0-9]{2}/[0-9]{2}$' then to_date(a.applied_date,'YYYY/MM/DD')
+          else null
+        end as applied_dt
+      from public.applications a
+    ), elig as (
+      select *, case when applied_dt is null then null else greatest(0, ((applied_dt + interval '7 years')::date - current_date)) end as days_remaining from raw
+    ), base as (
+      select * from ${days !== null ? 'elig' : 'raw'}
+      ${days !== null ? 'where applied_dt is null or days_remaining <= $DAYS$' : ''}
+    )`;
+
+    // Districts
+    let sqlD = `${base}
+      select b.district as name, count(*)::int as count
+      from base b
+      where b.district is not null and b.district <> ''
+        ${block ? 'and b.block = $2' : ''}
+      group by b.district
+      order by name asc`;
+    // Blocks
+    let sqlB = `${base}
+      select b.block as name, count(*)::int as count
+      from base b
+      where b.block is not null and b.block <> ''
+        ${district ? 'and b.district = $2' : ''}
+      group by b.block
+      order by name asc`;
+    // Villages
+    let sqlV = `${base}
+      select b.village as name, count(*)::int as count
+      from base b
+      where b.village is not null and b.village <> ''
+        ${district ? 'and b.district = $2' : ''}
+        ${block ? (district ? 'and b.block = $3' : 'and b.block = $2') : ''}
+      group by b.village
+      order by name asc`;
+
+    // Bind params
+    {
+      const params: any[] = [];
+      if (days !== null) { sqlD = sqlD.replace('$DAYS$', '$1'); params.push(days); }
+      if (block) params.push(block);
+      var dRows = await pool.query(sqlD, params);
+    }
+    {
+      const params: any[] = [];
+      if (days !== null) { sqlB = sqlB.replace('$DAYS$', '$1'); params.push(days); }
+      if (district) params.push(district);
+      var bRows = await pool.query(sqlB, params);
+    }
+    {
+      const params: any[] = [];
+      if (days !== null) { sqlV = sqlV.replace('$DAYS$', '$1'); params.push(days); }
+      if (district) params.push(district);
+      if (block)    params.push(block);
+      var vRows = await pool.query(sqlV, params);
+    }
+
+    return res.json({
+      ok: true,
+      ...(days !== null ? { days } : {}),
+      filters: {
+        districts: (dRows.rows || []).map(r => ({ name: r.name, count: Number(r.count || 0) })),
+        blocks:    (bRows.rows || []).map(r => ({ name: r.name, count: Number(r.count || 0) })),
+        villages:  (vRows.rows || []).map(r => ({ name: r.name, count: Number(r.count || 0) })),
+      }
+    });
+  } catch (e: any) {
+    console.error('/api/dashboard/leads/filters error:', e?.message || e);
+    return res.status(500).json({ ok: false, message: e?.message || 'Failed to load leads filters' });
+  }
+});
 
 // ==== SEND OTP (uses your exact logic) ====
 app.post("/auth/send-otp", async (req: Request, res: Response) => {
@@ -857,11 +1720,35 @@ app.get("/api/users/me", async (req: Request, res: Response) => {
   }
 });
 
+// Safe boolean parser for query/body flags (treats "false", "0", "no" as false)
+function parseBoolFlag(v: any): boolean {
+  if (typeof v === 'boolean') return v;
+  const s = String(v ?? '').trim().toLowerCase();
+  if (!s) return false;
+  if (['0','false','no','off','n'].includes(s)) return false;
+  if (['1','true','yes','on','y'].includes(s)) return true;
+  return false;
+}
 // ---- Unified: Aadhaar/Mobile ----
 app.post("/api/search/number", async (req: Request, res: Response) => {
-  const raw = String(req.body?.number || req.body?.aadhaar || req.body?.mobile || "");
+  const raw = String(req.body?.number || req.body?.aadhaar || req.body?.mobile || "").trim().replace(/\s+/g, '');
   const { kind, normalized } = classifyInputNumber(raw);
-  const force = Boolean((req.query && (req.query as any).force) || req.body?.force);
+  const qForce = (req.query as any)?.force;
+  const bForce = parseBoolFlag(qForce ?? req.body?.force);
+  const force = bForce === true;
+
+  // Parse optional days filter from query or body, or infer from Referer if absent
+  const daysRaw = (req.query as any)?.days ?? req.body?.days;
+  const daysNum = Number(daysRaw);
+  let daysFilter: number | null = Number.isFinite(daysNum) && daysNum > 0 ? daysNum : null;
+  if (daysFilter == null) {
+    const ref = String((req.headers as any)?.referer || (req.headers as any)?.referrer || '');
+    const m = ref.match(/[?&]days=(\d+)/);
+    if (m) {
+      const n = Number(m[1]);
+      if (Number.isFinite(n) && n > 0) daysFilter = n;
+    }
+  }
 
   if (!normalized || kind === "invalid") {
     return res.status(400).json({ ok: false, message: "Enter a valid Mobile (10 digits, with/without +91/0) or Aadhaar (12 digits)." });
@@ -871,19 +1758,16 @@ app.post("/api/search/number", async (req: Request, res: Response) => {
   let tnCalled = false;
 
   if (!force) {
-    const cached = await getApplicationsByNumber(normalized);
+    const cached = daysFilter
+      ? await getApplicationsByNumberWithinDays(normalized, daysFilter)
+      : await getApplicationsByNumber(normalized);
     console.log(`[search/number] cache length=${cached.length}`);
     if (cached.length) {
-      for (const app of cached) {
-        if (!app.has_statuses) {
-          try { await fetchAndStoreStatuses(app.application_id); app.has_statuses = true; }
-          catch (e) { console.warn("[/api/search/number] timeline fetch failed for", app.application_id, e); }
-        }
-        try { await fetchAndStorePrintMeta(app.application_id); } catch {}
-      }
       res.setHeader("x-sla-cache", "hit");
       res.setHeader("x-sla-tn", "skipped");
-      return res.json({ ok: true, applications: cached, cached: true });
+      if (daysFilter) res.setHeader('x-sla-days', String(daysFilter));
+      const enriched = await enrichApplicationsWithEligibility(cached as any);
+      return res.json({ ok: true, applications: enriched, cached: true, message: "Data already available in Farmhost DB.", ...(daysFilter ? { days: daysFilter } : {}) });
     }
   }
 
@@ -894,9 +1778,36 @@ app.post("/api/search/number", async (req: Request, res: Response) => {
     console.log(`[search/number] TN returned ${mapped.length} rows`);
     if (mapped.length) {
       await persistAppsSurveysStatusesMeta(mapped as any);
+      // Additionally, persist granular survey tuples (handles nested arrays from TN if present)
+      try {
+        const hasGeo = await ensureSurveySchema();
+        for (const a of mapped) {
+          const tuples = extractSurveyTuplesFromApp(a);
+          for (const t of tuples) {
+            if (hasGeo) {
+              await upsertApplicationSurvey(t.appId, t.survey_no, t.subdivision_no, t.district, t.block, t.village);
+            } else {
+              await upsertApplicationSurvey(t.appId, t.survey_no, t.subdivision_no);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[number→surveys] granular upsert skipped:', (e as any)?.message || e);
+      }
+      // When a days filter is requested, re-read from DB using the same eligibility window to ensure consistency
+      if (daysFilter) {
+        const filtered = await getApplicationsByNumberWithinDays(normalized, daysFilter);
+        res.setHeader("x-sla-cache", "miss");
+        res.setHeader("x-sla-tn", "called");
+        if (daysFilter) res.setHeader('x-sla-days', String(daysFilter));
+        const enriched = await enrichApplicationsWithEligibility(filtered as any);
+        return res.json({ ok: true, applications: enriched, cached: false, days: daysFilter });
+      }
       res.setHeader("x-sla-cache", "miss");
       res.setHeader("x-sla-tn", "called");
-      return res.json({ ok: true, applications: mapped, cached: false });
+      if (daysFilter) res.setHeader('x-sla-days', String(daysFilter));
+      const enriched = await enrichApplicationsWithEligibility(mapped as any);
+      return res.json({ ok: true, applications: enriched, cached: false });
     }
     res.setHeader("x-sla-cache", force ? "bypass" : "miss");
     res.setHeader("x-sla-tn", tnCalled ? "called" : "skipped");
@@ -1117,7 +2028,7 @@ app.get("/api/tn-print/:id", async (req: Request, res: Response) => {
 
 /* -------------------- BULK JOBS (DB-backed, persistent) -------------------- */
 
-type BulkJobStatus = "queued" | "running" | "done" | "error" | "canceled";
+type BulkJobStatus = "queued" | "running" | "paused" | "done" | "error" | "canceled";
 type BulkItemStatus = "pending" | "processing" | "ok" | "error";
 
 type BulkJobRow = {
@@ -1135,7 +2046,20 @@ type BulkJobRow = {
   last_error: string | null;
 };
 
-async function createBulkJob(total: number, created_by?: string | null): Promise<string> {
+async function createBulkJob(total: number, created_by?: string | null, desiredId?: string | null): Promise<string> {
+  if (desiredId) {
+    // try to use the provided id if unique
+    const exists = await pool.query(`SELECT 1 FROM bulk_jobs WHERE id = $1`, [desiredId]);
+    if (!exists.rowCount) {
+      const { rows } = await pool.query(
+        `INSERT INTO bulk_jobs (id, status, total, done, ok, error, created_by)
+         VALUES ($1, 'queued', $2, 0, 0, 0, $3)
+         RETURNING id::text`,
+        [desiredId, total, created_by ?? null]
+      );
+      return rows[0].id as string;
+    }
+  }
   const { rows } = await pool.query(
     `INSERT INTO bulk_jobs (status, total, done, ok, error, created_by)
      VALUES ('queued', $1, 0, 0, 0, $2)
@@ -1154,7 +2078,7 @@ async function insertBulkItems(jobId: string, numbers: string[]) {
     const cls = classifyInputNumber(raw);
     const kind = cls.kind === "invalid" ? "unknown" : cls.kind;
     const normalized = cls.normalized ?? raw.replace(/\D/g, "");
-    values.push(jobId, normalized, kind, "pending", "");
+    values.push(jobId, normalized, kind, "pending", "Queued for processing");
     tuples.push(`($${i + 1},$${i + 2},$${i + 3},$${i + 4},$${i + 5})`);
     i += 5;
   }
@@ -1174,7 +2098,7 @@ async function insertBulkAppItems(jobId: string, appIds: string[]) {
     const val = String(raw ?? "").trim();
     if (!val) continue;
     // kind = 'application'; store the raw App ID verbatim
-    values.push(jobId, val, "application", "pending", "");
+    values.push(jobId, val, "application", "pending", "Queued for processing");
     tuples.push(`($${i + 1},$${i + 2},$${i + 3},$${i + 4},$${i + 5})`);
     i += 5;
   }
@@ -1215,7 +2139,26 @@ async function getBulkJob(jobId: string): Promise<BulkJobRow | null> {
 
 async function getBulkItems(jobId: string, limit = 500) {
   const { rows } = await pool.query(
-    `SELECT id, number, kind, state AS status, message, created_at, updated_at
+    `SELECT 
+        id,
+        number,
+        kind,
+        state AS status,
+        message,
+        created_at,
+        updated_at,
+        -- Friendly display that preserves meaning even when the stored number is normalized
+        CASE 
+          WHEN lower(kind) = 'mobile' THEN 
+            CASE WHEN length(regexp_replace(number,'[^0-9]','','g')) >= 10
+                 THEN '+91 ' || right(regexp_replace(number,'[^0-9]','','g'), 10)
+                 ELSE number END
+          WHEN lower(kind) = 'aadhaar' THEN 
+            CASE WHEN length(regexp_replace(number,'[^0-9]','','g')) = 12
+                 THEN regexp_replace(regexp_replace(number,'[^0-9]','','g'),'^(\\d{4})(\\d{4})(\\d{4})$','\\1 \\2 \\3')
+                 ELSE number END
+          ELSE number
+        END AS display_number
      FROM bulk_job_items
      WHERE job_id = $1
      ORDER BY id ASC
@@ -1260,7 +2203,24 @@ async function purgeJobArtifacts(jobId: string): Promise<{ appIds: string[]; del
       }
     }
 
-    // 2) Expand appIds using numbers processed in this job
+    // --- 1. Fetch mobiles for any appIds collected from job items and add to mobiles ---
+    if (appIds.size) {
+      const q = await client.query(
+        `SELECT DISTINCT mobile
+           FROM public.applications
+          WHERE application_id = ANY($1::text[])`,
+        [Array.from(appIds)]
+      );
+      for (const r of q.rows) {
+        const m = String(r.mobile || '').replace(/\D/g, '').slice(-10);
+        if (m && /^\d{10}$/.test(m)) mobiles.push(m);
+      }
+    }
+    // dedupe mobiles
+    const mobileSet = new Set<string>(mobiles.filter(Boolean));
+    mobiles.length = 0; mobiles.push(...mobileSet);
+
+    // 2) Expand appIds using numbers processed in this job (mobiles)
     if (mobiles.length) {
       const q = await client.query(
         `SELECT application_id FROM public.applications WHERE mobile = ANY($1::text[])`,
@@ -1268,13 +2228,61 @@ async function purgeJobArtifacts(jobId: string): Promise<{ appIds: string[]; del
       );
       for (const r of q.rows) appIds.add(r.application_id);
     }
+    // 2b) Expand appIds using aadhaars (as before)
     if (aadhaars.length) {
-      const q = await client.query(
-        `SELECT application_id FROM public.applications WHERE aadhaar = ANY($1::text[])`,
-        [aadhaars]
-      );
-      for (const r of q.rows) appIds.add(r.application_id);
+      const aadhaarSet = new Set<string>(aadhaars.filter(Boolean));
+      const aadhaarArr = Array.from(aadhaarSet);
+      if (aadhaarArr.length) {
+        const q = await client.query(
+          `SELECT application_id FROM public.applications WHERE aadhaar = ANY($1::text[])`,
+          [aadhaarArr]
+        );
+        for (const r of q.rows) appIds.add(r.application_id);
+      }
     }
+
+    // --- Exclusion logic: protect items already available locally ---
+const exRowsQ = await client.query(
+  `SELECT number, kind, message FROM public.bulk_job_items WHERE job_id = $1 AND message ILIKE '%available in farmhost db%'`,
+  [jobId]
+);
+const excludeAppIds = new Set<string>();
+const excludeMobiles = new Set<string>();
+for (const r of (exRowsQ.rows || [])) {
+  const kind = String(r.kind || '').toLowerCase();
+  const num = String(r.number || '').trim();
+  if (!num) continue;
+  if (kind === 'application') {
+    excludeAppIds.add(num);
+  } else if (kind === 'mobile') {
+    const m = num.replace(/\D/g, '').slice(-10);
+    if (/^\d{10}$/.test(m)) excludeMobiles.add(m);
+  }
+}
+// From excluded application ids → mobiles
+if (excludeAppIds.size) {
+  const mQ = await client.query(
+    `SELECT DISTINCT mobile FROM public.applications WHERE application_id = ANY($1::text[]) AND mobile IS NOT NULL`,
+    [Array.from(excludeAppIds)]
+  );
+  for (const rr of mQ.rows) {
+    const m = String(rr.mobile || '').replace(/\D/g, '').slice(-10);
+    if (/^\d{10}$/.test(m)) excludeMobiles.add(m);
+  }
+}
+// From excluded mobiles → all their application ids
+if (excludeMobiles.size) {
+  const aQ = await client.query(
+    `SELECT application_id FROM public.applications WHERE mobile = ANY($1::text[])`,
+    [Array.from(excludeMobiles)]
+  );
+  for (const rr of aQ.rows) excludeAppIds.add(String(rr.application_id));
+}
+
+// Apply exclusions to the deletion set
+if (excludeAppIds.size) {
+  for (const id of excludeAppIds) appIds.delete(id);
+}
 
     const ids = Array.from(appIds);
     if (!ids.length) return { appIds: [], deleted_statuses: 0, deleted_surveys: 0, deleted_applications: 0 };
@@ -1318,12 +2326,42 @@ async function purgeJobArtifacts(jobId: string): Promise<{ appIds: string[]; del
   }
 }
 
+// put this small helper just ABOVE patchBulkItem (once):
+function stripSS(msg?: string | null): string {
+  if (typeof msg !== 'string') return '';
+  let s = msg.trim();
+  // Remove any embedded or trailing "SS: ..." segments, with or without bullets/dashes
+  // Cases handled:
+  //   "... • SS: text"
+  //   "... - SS: text"
+  //   "SS: text" (at start)
+  //   multiple occurrences
+  s = s.replace(/[\s]*[•\-]?[\s]*SS:\s*[^|]*$/gi, '');     // strip trailing SS to end
+  s = s.replace(/(?:^|\s)[•\-]?\s*SS:\s*[^•\-]+(?=\s[•\-]|$)/gi, ''); // strip embedded SS chunks between tokens
+  // Clean up duplicate spaces and stray separators left behind
+  s = s.replace(/\s{2,}/g, ' ').replace(/\s*[•\-]\s*$/g, '').trim();
+  return s;
+}
+
 async function patchBulkItem(jobId: string, number: string, status: BulkItemStatus, message: string) {
+  const rawMsg = String(message || '').trim() ||
+    (status === 'processing'
+      ? 'Processing…'
+      : status === 'ok'
+        ? 'Completed'
+        : status === 'error'
+          ? 'Processing failed'
+          : 'Queued for processing');
+  const msg = stripSS(rawMsg);
   await pool.query(
     `UPDATE bulk_job_items
      SET state = $3, message = $4, updated_at = now()
-     WHERE job_id = $1 AND number = $2`,
-    [jobId, number, status, message]
+     WHERE job_id = $1
+       AND (
+         number = $2
+         OR regexp_replace(number, '[^0-9]', '', 'g') = regexp_replace($2, '[^0-9]', '', 'g')
+       )`,
+    [jobId, number, status, msg]
   );
 }
 
@@ -1356,32 +2394,52 @@ async function processOneNumberDB(normalized: string): Promise<{ ok: boolean; me
         try { await fetchAndStoreStatuses(app.application_id); } catch (e) { console.warn("[bulk] timeline fetch failed:", e); }
       }
     }
-    return { ok: true, message: "Already available locally" };
+    return { ok: true, message: MSG_LOCAL };
   }
   // 2) TN
   const mapped = await fetchAppsByNumberFromTN(normalized);
   if (mapped.length) {
-    await upsertApplications(mapped as any);
-    for (const app of mapped) {
-      try { await fetchAndStoreStatuses(app.application_id); } catch (e) { console.warn("[bulk] timeline fetch failed:", e); }
-    }
-    return { ok: true, message: "Fetched from government sources" };
+    await persistAppsSurveysStatusesMeta(mapped as any);
+    return { ok: true, message: MSG_FETCHED };
   }
   return { ok: true, message: "No applications found – Farmer hasn’t used the services" };
 }
 
 // NOTE: it.number is the classifier's normalized value (12-digit Aadhaar or 10-digit mobile). Do not strip prefixes here.
+// ---- Bulk job status messages ----
+const MSG_CHECKING_LOCAL = "Checking Farmhost DB for existing records.";
+const MSG_LOCAL = "Data already available in Farmhost DB.";
+const MSG_FETCHING = "Fetching missing details from TN Government sources.";
+const MSG_FETCHED = "Fetched data from TN Government.";
+
 async function processBulkJob(jobId: string) {
   await setJobStatus(jobId, "running");
+  const REQUIRED_FIELDS: Array<keyof AppRow> = [
+    "crop_type",
+    "mi_name",
+    "applied_date",
+    "farmer_name",
+    "mi_area",
+    "total_area",
+    "survey_no",
+    "subdivision_no",
+    "farmer_type",
+    "ss",
+  ];
   // Before starting, check if job still exists and not canceled
   const activeBefore = await pool.query(`SELECT status FROM public.bulk_jobs WHERE id=$1`, [jobId]);
-  if (!activeBefore.rowCount || String(activeBefore.rows[0].status).toLowerCase() === "canceled") {
+  const stBefore = String(activeBefore.rows?.[0]?.status || '').toLowerCase();
+if (!activeBefore.rowCount || stBefore === "canceled" || stBefore === "paused") {
     return; // abort early if already canceled/deleted
   }
 
   let anyError = false;
   try {
-    const items = await getBulkItems(jobId, 100000); // all items for this job
+    const itemsAll = await getBulkItems(jobId, 100000);
+const items = itemsAll.filter(it => {
+  const s = String(it.status || '').toLowerCase();
+  return s !== 'ok' && s !== 'error';
+});
 
     // Concurrency for local+TN processing (rate limiter in tnPost keeps TN at TN_MAX_PER_MIN)
     const WORKERS = Math.max(
@@ -1400,7 +2458,8 @@ async function processBulkJob(jobId: string) {
       // Check cancellation between items
       try {
         const q = await pool.query(`SELECT status FROM public.bulk_jobs WHERE id=$1`, [jobId]);
-        if (!q.rowCount || String(q.rows[0].status).toLowerCase() === "canceled") {
+        const stNow = String(q.rows?.[0]?.status || '').toLowerCase();
+if (!q.rowCount || stNow === "canceled" || stNow === "paused") {
           return; // stop processing further items
         }
       } catch {}
@@ -1408,98 +2467,239 @@ async function processBulkJob(jobId: string) {
       try {
         const rawVal = String(it.number);
         if (String(it.kind) === "application") {
-          await patchBulkItem(jobId, rawVal, "processing", "Fetching application details…");
+          const appId = rawVal;
+          // 0) Start
+          await patchBulkItem(jobId, appId, "processing", MSG_CHECKING_LOCAL);
 
-          // 1) Print meta → gives district/block/village and may reveal mobile
-          let mobileFromMeta: string | null = null;
-          try {
-            const meta = await fetchAndStorePrintMeta(rawVal);
-            if (meta?.mobile) {
-              const m = normalizePhoneE164(meta.mobile);
-              if (m && m.length === 10) mobileFromMeta = m;
-            }
-          } catch {}
+          // 1) Load local row first
+          let appRow: any = null;
+          try { appRow = await getApplicationFullById(appId); } catch {}
 
-          // 2) Applications via discovered mobile (apps first) so they exist before statuses
-          if (mobileFromMeta) {
-            try {
-              const cachedApps = await getApplicationsByNumber(mobileFromMeta);
-              if (cachedApps.length) {
-                for (const app of cachedApps) {
-                  // ensure print meta and surveys for each app
-                  try { await fetchAndStorePrintMeta((app as any).application_id); } catch {}
-                  try { await replaceApplicationSurveys((app as any).application_id, (app as any).survey_no, (app as any).subdivision_no); } catch {}
-                }
-              } else {
-                const mappedApps = await fetchAppsByNumberFromTN(mobileFromMeta);
-                if (mappedApps.length) {
-                  await upsertApplications(mappedApps as any);
-                  for (const app of mappedApps) {
-                    try { await fetchAndStorePrintMeta(app.application_id); } catch {}
-                    try { await replaceApplicationSurveys(app.application_id, app.survey_no, app.subdivision_no); } catch {}
-                  }
-                }
-              }
-            } catch {}
+          // 1a) If district/block/village or mobile are missing, try to enrich minimal meta once
+          if (!appRow || !appRow.district || !appRow.block || !appRow.village || !appRow.mobile) {
+            try { await fetchAndStorePrintMeta(appId); } catch {}
+            try { appRow = await getApplicationFullById(appId); } catch {}
           }
 
-          // 3) Only after apps exist, fetch statuses for this Application ID
-          let statuses: any[] = [];
-          let gotFromCache = false;
-          try {
-            if (await hasStatuses(rawVal)) {
-              statuses = await getStatuses(rawVal);
-              gotFromCache = true;
-            } else {
-              statuses = await fetchAndStoreStatuses(rawVal);
-              gotFromCache = false;
+          // 1b) If this application is already complete locally, **do nothing**
+          if (appRow) {
+            const completeLocal = REQUIRED_FIELDS.every((k) => (appRow as any)[k] != null && String((appRow as any)[k]).trim() !== "");
+            const hasMeta = !!(appRow.district || appRow.block || appRow.village);
+            if (completeLocal && hasMeta) {
+              await patchBulkItem(jobId, appId, "ok", MSG_LOCAL);
+              await bumpJobCounters(jobId, 1, 1, 0);
+              return;
             }
-          } catch { statuses = []; }
+          }
 
-          const okMsg = (statuses && statuses.length)
-            ? (gotFromCache ? "Already available locally" : "Fetched from government sources")
-            : "No Data";
-          await patchBulkItem(jobId, rawVal, "ok", okMsg);
+          // 2) Identify contact from local row (prefer mobile; else aadhaar)
+          const mDigits = appRow?.mobile ? String(appRow.mobile).replace(/\D/g, "").slice(-10) : null;
+          const aDigits = appRow?.aadhaar ? String(appRow.aadhaar).replace(/\D/g, "") : null;
+          const mobile10  = mDigits && /^\d{10}$/.test(mDigits)   ? mDigits  : null;
+          const aadhaar12 = aDigits && /^\d{12}$/.test(aDigits) ? aDigits : null;
+          const contact = mobile10 || aadhaar12 || null;
+
+          // 3) Only call TN if contact’s local apps need enrichment
+          if (contact) {
+            // Prefer LOCAL for this contact; only call TN if enrichment is needed
+            let cachedByContact: AppRow[] = [];
+            try { cachedByContact = await getApplicationsByNumber(contact); } catch { cachedByContact = []; }
+            const hasLocal = cachedByContact && cachedByContact.length > 0;
+            const needsEnrichment = !hasLocal || cachedByContact.some((a: any) =>
+              REQUIRED_FIELDS.some((k) => (a as any)[k] == null || String((a as any)[k]).trim() === "")
+            );
+
+            if (!needsEnrichment) {
+            await patchBulkItem(jobId, appId, "ok", MSG_LOCAL);
+              await bumpJobCounters(jobId, 1, 1, 0);
+              return;
+            }
+
+            await patchBulkItem(jobId, appId, "processing", MSG_FETCHING);
+            let mapped: any[] = [];
+            try { mapped = await fetchAppsByNumberFromTN(contact); } catch { mapped = []; }
+            if (mapped.length) {
+              await upsertApplications(mapped as any);
+
+              // Link identifiers across all returned apps so future searches are unified
+              let linkRows: any[] = [];
+              if (mobile10) {
+                const aadFromMapped = mapped.find(a => (a as any).aadhaar)?.aadhaar || aadhaar12 || null;
+                linkRows = mapped.map(a => ({ application_id: a.application_id, source: "number", mobile: mobile10, ...(aadFromMapped ? { aadhaar: aadFromMapped } : {}) }));
+              } else if (aadhaar12) {
+                const mobFromMapped = mapped.find(a => (a as any).mobile)?.mobile || mobile10 || null;
+                linkRows = mapped.map(a => ({ application_id: a.application_id, source: "number", aadhaar: aadhaar12, ...(mobFromMapped ? { mobile: mobFromMapped } : {}) }));
+              }
+              if (linkRows.length) { await upsertApplications(linkRows as any); }
+
+              // Persist surveys (prefer granular tuples if TN returns nested lists; fallback to simple replace)
+              try {
+                for (const a of mapped) {
+                  let didGranular = false;
+                  try {
+                    const tuples = extractSurveyTuplesFromApp(a);
+                    if (Array.isArray(tuples) && tuples.length) {
+                      for (const t of tuples) {
+                        await upsertApplicationSurvey(
+                          t.appId,
+                          t.survey_no,
+                          t.subdivision_no,
+                          t.district,
+                          t.block,
+                          t.village
+                        );
+                      }
+                      didGranular = true;
+                    }
+                  } catch (_) {
+                    // fall through to replace
+                  }
+                  if (!didGranular) {
+                    await replaceApplicationSurveys(
+                      a.application_id,
+                      (a as any).survey_no ?? null,
+                      (a as any).subdivision_no ?? null
+                    );
+                  }
+                }
+              } catch (e) {
+                console.warn('[bulk/appId→surveys] upsert/replace skipped:', (e as any)?.message || e);
+              }
+
+              // Enrich every related application (best-effort)
+              for (const a of mapped) {
+                try { await fetchAndStoreStatuses(a.application_id); } catch {}
+                try { await fetchAndStorePrintMeta(a.application_id); } catch {}
+              }
+
+              await patchBulkItem(jobId, appId, "ok", MSG_FETCHED);
+              await bumpJobCounters(jobId, 1, 1, 0);
+              return;
+            } else {
+              // TN returned no apps; at least ensure statuses for this AppID
+              try { await fetchAndStoreStatuses(appId); } catch {}
+              await patchBulkItem(jobId, appId, "ok", MSG_FETCHED);
+              await bumpJobCounters(jobId, 1, 1, 0);
+              return;
+            }
+          }
+
+          // 4) No mobile or aadhaar on print page → at least store statuses for the AppID
+          try { await fetchAndStoreStatuses(appId); } catch {}
+          await patchBulkItem(jobId, appId, "ok", MSG_FETCHED);
           await bumpJobCounters(jobId, 1, 1, 0);
           return;
         }
 
-        await patchBulkItem(jobId, rawVal, "processing", "Checking local cache…");
-
+        // --- Unified number normalization and patching for bulk jobs ---
         const cls = classifyInputNumber(rawVal);
-        if (cls.kind === "invalid" || !cls.normalized) {
-          await patchBulkItem(jobId, rawVal, "error", "Invalid number format");
+        const numKey = cls.normalized || rawVal.replace(/\D/g, '');
+        if (cls.kind === "invalid" || !numKey) {
+          await patchBulkItem(jobId, numKey || rawVal, "error", "Invalid number format");
           await bumpJobCounters(jobId, 1, 0, 1);
           anyError = true;
           return;
         }
 
-        const cached = await getApplicationsByNumber(cls.normalized);
+        // Always patch processing with the normalized key so later updates hit the same row
+        await patchBulkItem(jobId, numKey, "processing", MSG_CHECKING_LOCAL);
+
+        const cached = await getApplicationsByNumber(numKey);
         if (cached.length) {
-          for (const app of cached) {
-            if (!(app as any).has_statuses) {
-              try { await fetchAndStoreStatuses((app as any).application_id); } catch {}
-            }
-            try { await fetchAndStorePrintMeta((app as any).application_id); } catch {}
+          // For Aadhaar: if we already have any local rows, DO NOT call TN at all.
+          if (cls.kind === "aadhaar") {
+            await patchBulkItem(jobId, numKey, 'ok', MSG_LOCAL);
+            await bumpJobCounters(jobId, 1, 1, 0);
+            return;
           }
-          await patchBulkItem(jobId, cls.normalized, "ok", "Already available locally");
-          await bumpJobCounters(jobId, 1, 1, 0);
-          return;
+
+          // For Mobile: only call TN if enrichment is actually needed
+          const needsEnrichment = cached.some((a: any) => {
+            return REQUIRED_FIELDS.some((k) => a[k] == null || String(a[k]).trim() === '');
+          });
+          if (!needsEnrichment) {
+            // Local data complete → stop here
+            await patchBulkItem(jobId, numKey, 'ok', MSG_LOCAL);
+            await bumpJobCounters(jobId, 1, 1, 0);
+            return;
+          }
+          // Else continue below to fetch from TN to enrich missing fields
         }
 
-        await patchBulkItem(jobId, cls.normalized, "processing", "Pulling from government sources…");
-
-        const mapped = await fetchAppsByNumberFromTN(cls.normalized);
+        // At this point, either no local data or incomplete data: fetch from TN
+        await patchBulkItem(jobId, numKey, "processing", MSG_FETCHING);
+        const mapped = await fetchAppsByNumberFromTN(numKey);
         if (mapped.length) {
           await upsertApplications(mapped as any);
+          // Link identifiers: after upsert, if any mapped row has aadhaar/mobile, upsert for all
+          let linkRows: any[] = [];
+          if (cls.kind === "mobile") {
+            const aadhaar = mapped.find(a => a.aadhaar) ? mapped.find(a => a.aadhaar)?.aadhaar : null;
+            linkRows = mapped.map(a => ({
+              application_id: a.application_id,
+              source: "number",
+              mobile: numKey,
+              ...(aadhaar ? { aadhaar } : {})
+            }));
+          } else if (cls.kind === "aadhaar") {
+            const mobile = mapped.find(a => a.mobile) ? mapped.find(a => a.mobile)?.mobile : null;
+            linkRows = mapped.map(a => ({
+              application_id: a.application_id,
+              source: "number",
+              aadhaar: numKey,
+              ...(mobile ? { mobile } : {})
+            }));
+          }
+          if (linkRows.length) {
+            await upsertApplications(linkRows as any);
+          }
+          // Persist surveys (prefer granular tuples if TN returns nested lists; fallback to simple replace)
+          try {
+            for (const a of mapped) {
+              let didGranular = false;
+              try {
+                const tuples = extractSurveyTuplesFromApp(a);
+                if (Array.isArray(tuples) && tuples.length) {
+                  for (const t of tuples) {
+                    await upsertApplicationSurvey(
+                      t.appId,
+                      t.survey_no,
+                      t.subdivision_no,
+                      t.district,
+                      t.block,
+                      t.village
+                    );
+                  }
+                  didGranular = true;
+                }
+              } catch (_) {
+                // fall through to replace
+              }
+              if (!didGranular) {
+                await replaceApplicationSurveys(
+                  a.application_id,
+                  (a as any).survey_no ?? null,
+                  (a as any).subdivision_no ?? null
+                );
+              }
+            }
+          } catch (e) {
+            console.warn('[bulk/number→surveys] upsert/replace skipped:', (e as any)?.message || e);
+          }
           for (const app of mapped) {
             try { await fetchAndStoreStatuses(app.application_id); } catch {}
             try { await fetchAndStorePrintMeta(app.application_id); } catch {}
           }
-          await patchBulkItem(jobId, cls.normalized, "ok", "Fetched from government sources");
+          await patchBulkItem(
+            jobId,
+            numKey,
+            "ok",
+            MSG_FETCHED
+          );
           await bumpJobCounters(jobId, 1, 1, 0);
         } else {
-          await patchBulkItem(jobId, cls.normalized, "ok", "No applications found – Farmer hasn’t used the services");
+          // No applications found at all
+          await patchBulkItem(jobId, numKey, "ok", "No applications found – Farmer hasn’t used the services");
           await bumpJobCounters(jobId, 1, 1, 0);
         }
       } catch (e: any) {
@@ -1517,8 +2717,17 @@ async function processBulkJob(jobId: string) {
     anyError = true;
     console.error("[bulk] processBulkJob fatal error:", (e as any)?.message || e);
   } finally {
-    // Always set a terminal status so UI doesn't stay stuck at running
-    await setJobStatus(jobId, anyError ? "error" : "done");
+    // If user canceled, keep 'canceled' status; otherwise set terminal status
+    try {
+      const q = await pool.query(`SELECT status FROM public.bulk_jobs WHERE id=$1`, [jobId]);
+      const st = String(q.rows?.[0]?.status || '').toLowerCase();
+      if (st !== 'canceled' && st !== 'paused') {
+        await setJobStatus(jobId, anyError ? 'error' : 'done');
+      }
+    } catch {
+      // Fallback: if we cannot read status, set terminal status
+      await setJobStatus(jobId, anyError ? 'error' : 'done');
+    }
   }
 }
 
@@ -1527,7 +2736,10 @@ async function processBulkJob(jobId: string) {
 // List recent bulk jobs (last N days). If you don't scope by user, this returns all recent jobs.
 app.get("/api/bulk/recent", async (req: Request, res: Response) => {
   try {
-    const days = Math.max(1, Math.min(14, parseInt(String(req.query.days ?? "2"), 10) || 2));
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    const days = Math.max(1, Math.min(30, parseInt(String(req.query.days ?? "2"), 10) || 2));
 
     // Summaries joined with item counts
     const { rows } = await pool.query(
@@ -1571,11 +2783,16 @@ app.get("/api/bulk/recent", async (req: Request, res: Response) => {
 // Latest job (for auto-resume in UI)
 app.get("/api/bulk/latest", async (_req: Request, res: Response) => {
   try {
-    const { rows } = await pool.query(
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    const { rows } = await pgQueryRetry(
       `select id::text, status, total, done, ok, error, created_at::text, updated_at::text, created_by
          from bulk_jobs
         order by created_at desc
-        limit 1`
+        limit 1`,
+      [],
+      3
     );
     if (!rows.length) return res.json({ ok: true, job: null, jobId: null });
     const j = rows[0];
@@ -1589,24 +2806,69 @@ app.get("/api/bulk/latest", async (_req: Request, res: Response) => {
 // Start bulk job
 app.post("/api/bulk/start", async (req: Request, res: Response) => {
   try {
-    const raw = req.body?.numbers;
-    if (!Array.isArray(raw)) return res.status(400).json({ ok: false, message: "numbers[] required (array of strings)" });
+    const rawNums = req.body?.numbers;
+    const rawApps = (req.body?.appIds ?? req.body?.appids ?? req.body?.application_ids ?? req.body?.applicationIds ?? req.body?.ids);
 
-    // Normalize to digit-only strings (we will re-classify again per-item)
-    const nums: string[] = raw.map((x: any) => String(x ?? "")).filter(s => s.trim().length > 0);
-    if (!nums.length) return res.status(400).json({ ok: false, message: "No numbers to process." });
+    // Coercers: allow arrays, CSV strings, newline strings, or JSON-encoded strings
+    const coerceList = (v: any): string[] => {
+      if (Array.isArray(v)) return v.map((x) => String(x ?? ''));
+      if (typeof v === 'string') {
+        const s = v.trim();
+        if (!s) return [];
+        // try JSON first
+        try {
+          const parsed = JSON.parse(s);
+          if (Array.isArray(parsed)) return parsed.map((x: any) => String(x ?? ''));
+        } catch (_) {}
+        // fallback: split by newlines/commas/semicolons
+        return s.split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean);
+      }
+      return [];
+    };
+
+    if (
+      (!Array.isArray(rawNums) && typeof rawNums !== 'string' && !rawNums) &&
+      (!Array.isArray(rawApps) && typeof rawApps !== 'string' && !rawApps)
+    ) {
+      console.warn('[bulk/start] bad payload: neither numbers[] nor appIds[] present');
+      return res.status(400).json({ ok: false, message: "numbers[] or appIds[] required (array, CSV, or string)" });
+    }
+
+    const nums: string[] = coerceList(rawNums).map((s) => s.trim()).filter((s) => s.length > 0);
+    const appIds: string[] = coerceList(rawApps).map((s) => s.trim()).filter((s) => s.length > 0);
+
+    console.log('[bulk/start] received', { numbers: nums.length, appIds: appIds.length });
+
+    if (nums.length === 0 && appIds.length === 0) {
+      return res.status(400).json({ ok: false, message: "No items to process." });
+    }
 
     const created_by = String(req.body?.created_by || "").trim() || null;
-    const jobId = await createBulkJob(nums.length, created_by);
-    await insertBulkItems(jobId, nums);
+    const total = nums.length + appIds.length;
+    let jobId: string;
+    try {
+      jobId = await createBulkJob(total, created_by);
+    } catch (e: any) {
+      console.error('[bulk/start] createBulkJob failed:', e?.message || e);
+      return res.status(500).json({ ok: false, message: 'Failed to create job (DB schema mismatch?)' });
+    }
+    try {
+      if (nums.length) await insertBulkItems(jobId, nums);
+      if (appIds.length) await insertBulkAppItems(jobId, appIds);
+    } catch (e: any) {
+      console.error('[bulk/start] insert items failed:', e?.message || e);
+      return res.status(500).json({ ok: false, message: 'Failed to insert job items (check bulk_job_items schema).'});
+    }
+
+    console.log('[bulk/start] job created', { jobId, total });
 
     // async fire-and-forget
-    processBulkJob(jobId).catch((e) => console.error("[bulk] processor error:", e));
+    processBulkJob(jobId).catch((e) => console.error('[bulk] processor error:', e));
 
     return res.json({ ok: true, jobId });
   } catch (e: any) {
-    console.error("/api/bulk/start error:", e);
-    return res.status(500).json({ ok: false, message: e?.message || "Failed to start bulk job" });
+    console.error('/api/bulk/start error:', e);
+    return res.status(500).json({ ok: false, message: e?.message || 'Failed to start bulk job' });
   }
 });
 
@@ -1636,42 +2898,70 @@ app.post("/api/bulk/start-appid", async (req: Request, res: Response) => {
 // Job status (derived live from public.bulk_job_items)
 app.get("/api/bulk/:id/status", async (req: Request, res: Response) => {
   res.set("Content-Type", "application/json");
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
   const jobId = String(req.params.id || "").trim();
   if (!jobId) return res.status(400).json({ ok: false, message: "Missing job id" });
   try {
     // Load job row
-    const jobQ = await pool.query(
+    const jobQ = await pgQueryRetry(
       `SELECT id::text, status, total, done, ok, error,
               created_at::text, updated_at::text, created_by
          FROM public.bulk_jobs
         WHERE id = $1`,
-      [jobId]
+      [jobId],
+      3
     );
     if (jobQ.rowCount === 0) return res.status(404).json({ ok: false, message: "Job not found" });
     const job = jobQ.rows[0];
 
     // Load items directly (schema-agnostic) and normalize in JS
-    let items: Array<{ number: string; kind: string; state: string; message: string; updated_at: any }>;
+    let raw: any[] = [];
     try {
-      const itemsQ = await pool.query(
+      const itemsQ = await pgQueryRetry(
         `SELECT *
            FROM public.bulk_job_items
           WHERE job_id = $1
           ORDER BY id ASC
           LIMIT 10000`,
-        [jobId]
+        [jobId],
+        3
       );
-      const raw = itemsQ.rows || [];
-      items = raw.map((it: any) => ({
-        number: String(it.number ?? it.input ?? it.value ?? it.raw ?? ""),
-        kind: String((it.kind ?? it.item_kind ?? it.type ?? 'unknown')).toLowerCase(),
-        state: String((it.state ?? it.status ?? it.result ?? 'pending')).toLowerCase(),
-        message: String(it.message ?? it.detail ?? it.last_message ?? ''),
-        updated_at: it.updated_at ?? it.created_at ?? null,
-      }));
-    } catch (e) {
-      console.error('[bulk status] items fetch error', e);
-      items = [];
+      raw = itemsQ.rows || [];
+    } catch (e: any) {
+      console.error('[bulk status] items fetch final failure:', e?.message || e);
+      raw = [];
+    }
+    let items: Array<{ number: string; kind: string; state: string; message: string; updated_at: any }>;
+    items = raw.map((it: any) => ({
+      number: String(it.number ?? it.input ?? it.value ?? it.raw ?? ""),
+      kind: String((it.kind ?? it.item_kind ?? it.type ?? 'unknown')).toLowerCase(),
+      state: String((it.state ?? it.status ?? it.result ?? 'pending')).toLowerCase(),
+      message: String(it.message ?? it.detail ?? it.last_message ?? ''),
+      updated_at: it.updated_at ?? it.created_at ?? null,
+    }));
+
+    // Ensure messages are always present and human-friendly
+    items = items.map((it) => {
+      const msg = String(it.message || '').trim();
+      if (msg) return it;
+      let fallback = '';
+      switch (it.state) {
+        case 'pending':    fallback = 'Queued for processing'; break;
+        case 'processing': fallback = 'Processing…'; break;
+        case 'ok':         fallback = 'Completed'; break;
+        case 'error':      fallback = 'Processing failed'; break;
+        default:           fallback = 'Queued for processing';
+      }
+      return { ...it, message: fallback };
+    });
+
+    // Strip any trailing SS summary from messages for clean UI
+    for (const it of items as any[]) {
+      if (it && typeof it.message === 'string') {
+        it.message = stripSS(it.message);
+      }
     }
 
     // Derive counters from items (authoritative)
@@ -1812,6 +3102,20 @@ app.post('/api/bulk/delete', async (req: Request, res: Response) => {
   }
 });
 
+// Tiny debug endpoint to peek at recent jobs
+app.get('/api/bulk/debug/peek', async (_req: Request, res: Response) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id::text, status, total, done, ok, error, created_at::text, created_by
+         FROM public.bulk_jobs
+        ORDER BY created_at DESC
+        LIMIT 5`);
+    return res.json({ ok: true, jobs: rows });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, message: e?.message || 'peek failed' });
+  }
+});
+
 // (Optional) list jobs summary
 app.get("/api/bulk", async (_req: Request, res: Response) => {
   const { rows } = await pool.query(
@@ -1823,43 +3127,74 @@ app.get("/api/bulk", async (_req: Request, res: Response) => {
   res.json({ ok: true, jobs: rows });
 });
 
-// Cancel a job AND delete everything created by it (artifacts + job rows)
+// Pause a job (non-destructive: keeps items and progress)
+app.post("/api/bulk/:id/pause", async (req: Request, res: Response) => {
+  res.set("Content-Type", "application/json");
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ ok: false, message: "Missing job id" });
+  try {
+    await setJobStatus(id, "paused");
+    // Do not mutate item states; workers check paused and stop naturally
+    return res.json({ ok: true, paused: true });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, message: e?.message || "Failed to pause job" });
+  }
+});
+
+// Resume a paused job (continues remaining items)
+app.post("/api/bulk/:id/resume", async (req: Request, res: Response) => {
+  res.set("Content-Type", "application/json");
+  const id = String(req.params.id || "").trim();
+  if (!id) return res.status(400).json({ ok: false, message: "Missing job id" });
+  try {
+    // Mark queued (processor will set running) and fire the worker
+    await setJobStatus(id, "queued");
+    processBulkJob(id).catch((e) => console.error('[bulk/resume] processor error:', e));
+    return res.json({ ok: true, status: 'queued' });
+  } catch (e: any) {
+    return res.status(500).json({ ok: false, message: e?.message || "Failed to resume job" });
+  }
+});
+
+// Cancel a job (stop processing only; do not purge or delete)
 app.post("/api/bulk/:id/cancel", async (req: Request, res: Response) => {
   res.set("Content-Type", "application/json");
   const id = String(req.params.id || "").trim();
   if (!id) return res.status(400).json({ ok: false, message: "Missing job id" });
   try {
-    // 1) Mark job canceled (best-effort; may be deleted right after)
-    try { await setJobStatus(id, "canceled"); } catch {}
+    // Mark job as canceled
+    await setJobStatus(id, "canceled");
 
-    // 2) Purge artifacts created/affected by this job
-    let purgeInfo: any = null;
-    try { purgeInfo = await purgeJobArtifacts(id); } catch (e: any) { purgeInfo = { error: e?.message || String(e) }; }
+    // Mark any pending/processing items to error with a clear message for UI
+    await pool.query(
+      `UPDATE public.bulk_job_items
+         SET state = 'error', message = 'Canceled by user', updated_at = now()
+       WHERE job_id = $1 AND lower(coalesce(state,'')) IN ('pending','processing')`,
+      [id]
+    );
 
-    // 3) Delete job items and the job
-    await pool.query(`DELETE FROM public.bulk_job_items WHERE job_id = $1`, [id]);
-    await pool.query(`DELETE FROM public.bulk_jobs WHERE id = $1`, [id]);
-
-    return res.json({ ok: true, canceled: true, purged: true, purgeInfo, deleted_applications: purgeInfo?.deleted_applications ?? 0 });
+    return res.json({ ok: true, canceled: true });
   } catch (e: any) {
-    return res.status(500).json({ ok: false, message: e?.message || "Failed to cancel and delete job" });
+    return res.status(500).json({ ok: false, message: e?.message || "Failed to cancel job" });
   }
 });
 
-// Fallback: allow POST /api/bulk/cancel { id }
+// Fallback: allow POST /api/bulk/cancel { id } (stop processing only)
 app.post("/api/bulk/cancel", async (req: Request, res: Response) => {
   res.set("Content-Type", "application/json");
   const id = String(req.body?.id || "").trim();
   if (!id) return res.status(400).json({ ok: false, message: "Missing job id" });
   try {
-    try { await setJobStatus(id, "canceled"); } catch {}
-    let purgeInfo: any = null;
-    try { purgeInfo = await purgeJobArtifacts(id); } catch (e: any) { purgeInfo = { error: e?.message || String(e) }; }
-    await pool.query(`DELETE FROM public.bulk_job_items WHERE job_id = $1`, [id]);
-    await pool.query(`DELETE FROM public.bulk_jobs WHERE id = $1`, [id]);
-    return res.json({ ok: true, canceled: true, purged: true, purgeInfo, deleted_applications: purgeInfo?.deleted_applications ?? 0 });
+    await setJobStatus(id, "canceled");
+    await pool.query(
+      `UPDATE public.bulk_job_items
+         SET state = 'error', message = 'Canceled by user', updated_at = now()
+       WHERE job_id = $1 AND lower(coalesce(state,'')) IN ('pending','processing')`,
+      [id]
+    );
+    return res.json({ ok: true, canceled: true });
   } catch (e: any) {
-    return res.status(500).json({ ok: false, message: e?.message || "Failed to cancel and delete job" });
+    return res.status(500).json({ ok: false, message: e?.message || "Failed to cancel job" });
   }
 });
 
@@ -1887,6 +3222,137 @@ app.listen(PORT, () => {
   }, 60 * 60 * 1000); // hourly
 });
 
+// ================= Customer Summary (by mobile) =================
+// GET /api/customers/summary?mobile=XXXXXXXXXX
+app.get('/api/customers/summary', async (req: Request, res: Response) => {
+  try {
+    const raw = String((req.query as any)?.mobile || '');
+    const m10 = normalizeMobile10Strict(raw);
+    if (!m10) {
+      return res.json({
+        ok: true, key: '', applications: [],
+        total_applications: 0, total_area: 0, total_mi_area: 0,
+        districts: [], blocks: [], villages: [], crops: [], mi_names: []
+      });
+    }
+
+    // Guard: does applications have 'aadhaar'?
+    const hasAadhaarCol = await pool.query(
+      `select 1 from information_schema.columns where table_schema='public' and table_name='applications' and column_name='aadhaar' limit 1`
+    ).then(r => r.rowCount === 1).catch(() => false);
+
+    let apps: any[] = [];
+    if (hasAadhaarCol) {
+      const sql = `
+        WITH base AS (
+          SELECT a.*
+            FROM public.applications a
+           WHERE RIGHT(regexp_replace(COALESCE(a.mobile,''),'[^0-9]','','g'),10) = $1
+        ), linked AS (
+          SELECT a.*
+            FROM public.applications a
+           WHERE RIGHT(regexp_replace(COALESCE(a.mobile,''),'[^0-9]','','g'),10) = $1
+              OR RIGHT(regexp_replace(COALESCE(a.aadhaar,''),'[^0-9]','','g'),12) IN (
+                   SELECT RIGHT(regexp_replace(COALESCE(b.aadhaar,''),'[^0-9]','','g'),12)
+                     FROM base b
+                    WHERE COALESCE(b.aadhaar,'') <> ''
+                 )
+        )
+        SELECT * FROM linked`;
+      const r = await pgQueryRetry(sql, [m10]);
+      apps = r.rows || [];
+    } else {
+      // Fallback: no 'aadhaar' column — just pull by mobile
+      const sql = `
+        SELECT a.*
+          FROM public.applications a
+         WHERE RIGHT(regexp_replace(COALESCE(a.mobile,''),'[^0-9]','','g'),10) = $1`;
+      const r = await pgQueryRetry(sql, [m10]);
+      apps = r.rows || [];
+    }
+
+    // Surveys (only if table exists)
+    const haveSurveyTable = await tableExists('public', 'application_surveys');
+    const appIds = apps.map(r => r.application_id).filter(Boolean);
+    const surveysByApp: Record<string, any[]> = {};
+    if (haveSurveyTable && appIds.length) {
+      try {
+        const { rows: sv } = await pgQueryRetry(
+          `SELECT application_id, survey_no, subdivision_no
+             FROM public.application_surveys
+            WHERE application_id = ANY($1::text[])`,
+          [appIds]
+        );
+        for (const s of sv) {
+          (surveysByApp[s.application_id] ||= []).push({
+            survey_no: s.survey_no ?? null,
+            subdivision_no: s.subdivision_no ?? null,
+          });
+        }
+      } catch {
+        // ignore survey errors entirely
+      }
+    }
+
+    // Build response – tolerate missing columns gracefully
+    const num = (v: any) => (v == null ? null : Number(v));
+    const pick = (o: any, k: string) => (o && Object.prototype.hasOwnProperty.call(o, k) ? o[k] : null);
+
+    const applications = apps.map(a => ({
+      application_id: pick(a, 'application_id'),
+      farmer_name: pick(a, 'farmer_name'),
+      mobile: pick(a, 'mobile'),
+      aadhaar: pick(a, 'aadhaar'),
+      district: pick(a, 'district'),
+      block: pick(a, 'block'),
+      village: pick(a, 'village'),
+      crop_type: pick(a, 'crop_type'),
+      mi_name: pick(a, 'mi_name'),
+      total_area: num(pick(a, 'total_area')),
+      mi_area: num(pick(a, 'mi_area')),
+      applied_date: pick(a, 'applied_date'),
+      last_status: pick(a, 'ss'),
+      last_status_date: null,
+      completed_at: null,
+      days_left: null,
+      surveys: surveysByApp[pick(a, 'application_id')] || [],
+    }));
+
+    const uniq = (arr: any[]) => {
+      const out: string[] = []; const seen = new Set<string>();
+      for (const v of arr.map(x => (x ?? '').toString().trim()).filter(Boolean)) {
+        const k = v.toLowerCase(); if (!seen.has(k)) { seen.add(k); out.push(v); }
+      }
+      return out;
+    };
+
+    const totalApplications = applications.length;
+    const totalArea = applications.reduce((s, r: any) => s + (Number(r.total_area) || 0), 0);
+    const totalMiArea = applications.reduce((s, r: any) => s + (Number(r.mi_area) || 0), 0);
+
+    return res.json({
+      ok: true,
+      key: `+91${m10}`,
+      applications,
+      total_applications: totalApplications,
+      total_area: Number(totalArea.toFixed(2)),
+      total_mi_area: Number(totalMiArea.toFixed(2)),
+      districts: uniq(applications.map(a => a.district)),
+      blocks:    uniq(applications.map(a => a.block)),
+      villages:  uniq(applications.map(a => a.village)),
+      crops:     uniq(applications.map(a => a.crop_type)),
+      mi_names:  uniq(applications.map(a => a.mi_name)),
+    });
+  } catch (e: any) {
+    console.warn('/api/customers/summary error:', e?.message || e);
+    // Never 500 – return empty instead
+    return res.json({
+      ok: true, key: '', applications: [],
+      total_applications: 0, total_area: 0, total_mi_area: 0,
+      districts: [], blocks: [], villages: [], crops: [], mi_names: []
+    });
+  }
+});
 // ---- Fast statuses by application id (DB-first, no TN unless FE calls /api/search/application) ----
 app.get("/api/statuses", async (req: Request, res: Response) => {
   try {

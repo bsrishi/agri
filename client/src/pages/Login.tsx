@@ -41,10 +41,20 @@ function classNames(...arr: Array<string | false | null | undefined>) {
 
 const Login: React.FC = () => {
   const navigate = useNavigate();
+  // Detect ?loggedout=1 in URL and show logout notice
+  const params = new URLSearchParams(window.location.search);
+  const initialNotice = params.get("loggedout") === "1"
+    ? "You have been successfully logged out. Please login again."
+    : null;
+  // Delay rendering until notice is initialized to prevent flicker
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    setReady(true);
+  }, []);
   const [step, setStep] = useState<"phone" | "otp">("phone");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(initialNotice);
 
   const [phone, setPhone] = useState("");
   const [otp, setOtp] = useState<string[]>(Array.from({ length: OTP_LENGTH }, () => ""));
@@ -77,7 +87,9 @@ const Login: React.FC = () => {
   const onSendOtp = async (e?: React.FormEvent) => {
     e?.preventDefault();
     setError(null);
-    setNotice(null);
+    if (notice !== "You have been successfully logged out. Please login again.") {
+      setNotice(null);
+    }
 
     const raw = phone.trim();
     if (!PHONE_REGEX.test(raw)) {
@@ -124,7 +136,9 @@ const Login: React.FC = () => {
 
   const onVerify = async () => {
     setError(null);
-    setNotice(null);
+    if (notice !== "You have been successfully logged out. Please login again.") {
+      setNotice(null);
+    }
     const code = otp.join("");
     if (code.length !== OTP_LENGTH) {
       setError("Enter the 6‑digit OTP.");
@@ -219,6 +233,7 @@ const Login: React.FC = () => {
   const canSend = PHONE_REGEX.test(phone.trim()) && !loading;
   const canVerify = otp.every((d) => d) && !loading;
 
+  if (!ready) return null;
   return (
     <div className="sla-login-root">
       <div className="sla-bg" aria-hidden />

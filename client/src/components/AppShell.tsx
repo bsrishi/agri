@@ -128,6 +128,18 @@ export default function AppShell({
     }
   });
 
+  // Mobile drawer state (for < md screens)
+  const [mobileNavOpen, setMobileNavOpen] = React.useState(false);
+
+  // Lock body scroll when drawer is open
+  React.useEffect(() => {
+    if (mobileNavOpen) {
+      const prev = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
+      return () => { document.body.style.overflow = prev; };
+    }
+  }, [mobileNavOpen]);
+
   React.useEffect(() => {
     try {
       localStorage.setItem("sla_sidebar_collapsed", collapsed ? "1" : "0");
@@ -178,7 +190,13 @@ export default function AppShell({
   }) ?? false;
 
   return (
-    <div className="flex h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100">
+    <div
+      className="flex h-screen bg-white text-slate-900 dark:bg-slate-950 dark:text-slate-100 font-sans antialiased text-[15px] sm:text-[15.5px] md:text-[16px]"
+      style={{
+        fontFamily:
+          "Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Apple Color Emoji', 'Segoe UI Emoji'",
+      }}
+    >
       {/* Sidebar */}
       <aside
         aria-label="Sidebar Navigation"
@@ -190,32 +208,27 @@ export default function AppShell({
         ].join(" ")}
       >
         {/* Brand / Collapse */}
-        <div className="flex h-16 items-center justify-start px-2 border-b border-slate-200 dark:border-slate-800">
+        <div className={[
+          "flex h-16 items-center px-0 border-b border-slate-200 dark:border-slate-800",
+          collapsed ? "justify-center" : "justify-start"
+        ].join(" ")}
+        >
           <button
             onClick={onHome}
             title={companyName}
             aria-label={`${companyName} home`}
-            className={["flex items-center px-1 py-1 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/30", "gap-3"].join(" ")}
+            className={[
+              "flex items-center px-0 py-1 rounded-lg focus:outline-none focus:ring-2 focus:ring-emerald-500/30",
+              collapsed ? "gap-0" : "gap-3"
+            ].join(" ")}
           >
             {/* Keep logo size constant to avoid flicker/resize */}
-            <div className="h-16 w-[64px] flex-none grid place-items-center">
+            <div className="h-16 w-16 flex-none flex items-center justify-center">
               <img
                 src="/sla-icon.png"
                 alt="Sri Lakshmi Agro"
-                className="h-16 w-auto object-contain"
+                className="h-10 w-auto max-w-full object-contain"
               />
-            </div>
-            {/* Keep name mounted; animate width only on container for smooth effect */}
-            <div
-              className={[
-                "overflow-hidden transition-[width,margin] duration-200 ease-out",
-                collapsed ? "w-0 ml-0" : "w-[180px] ml-1"
-              ].join(" ")}
-              aria-hidden={collapsed}
-            >
-              <span className="block text-base font-extrabold tracking-tight">
-                {companyName}
-              </span>
             </div>
           </button>
         </div>
@@ -365,12 +378,36 @@ export default function AppShell({
       <div className="flex min-w-0 flex-1 flex-col">
         {/* Topbar (mobile + desktop) */}
         <header className="sticky top-0 z-40 h-16 border-b border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-slate-900/90 backdrop-blur">
-          <div className="h-full px-3 sm:px-4 flex items-center justify-between">
-            {/* Left: (empty block to preserve spacing) */}
-            <div />
+          <div className="h-full pl-3 sm:pl-4 pr-2 sm:pr-3 relative flex items-center">
+            {/* Left: Mobile hamburger (hidden on md+) */}
+            <div className="md:hidden">
+              <button
+                type="button"
+                onClick={() => setMobileNavOpen(true)}
+                aria-label="Open navigation"
+                className="grid h-10 w-10 place-items-center rounded-full border border-emerald-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-emerald-50 dark:hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/30"
+              >
+                <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                  <path d="M4 6h16" />
+                  <path d="M4 12h16" />
+                  <path d="M4 18h16" />
+                </svg>
+              </button>
+            </div>
+            {/* Center: Company name brand button */}
+            <button
+              onClick={onHome}
+              title={companyName}
+              aria-label={`${companyName} home`}
+              className="absolute left-1/2 -translate-x-1/2 min-w-0 flex items-center gap-2 px-1 py-1 rounded-md hover:bg-emerald-50 dark:hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/30"
+            >
+              <span className="text-base sm:text-lg font-extrabold tracking-tight truncate">
+                {companyName}
+              </span>
+            </button>
 
             {/* Right controls */}
-            <div className="flex items-center gap-1.5">
+            <div className="ml-auto flex items-center gap-1.5">
               <div
                 className="relative"
                 onMouseLeave={closeZoom}
@@ -445,7 +482,12 @@ export default function AppShell({
 
               {/* Logout */}
               <button
-                onClick={onLogout}
+                onClick={() => {
+                  if (window.confirm("Are you sure you want to log out?")) {
+                    onLogout();
+                    window.location.assign("/login?loggedout=1");
+                  }
+                }}
                 className="grid h-10 w-10 place-items-center rounded-full border border-emerald-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-emerald-50 dark:hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/30"
                 aria-label="Log out"
                 title="Log out"
@@ -455,6 +497,119 @@ export default function AppShell({
             </div>
           </div>
         </header>
+
+        {/* Mobile drawer (only on small screens) */}
+        {mobileNavOpen && (
+          <div className="fixed inset-0 z-[60] md:hidden" role="dialog" aria-modal="true">
+            {/* Backdrop */}
+            <div
+              className="absolute inset-0 bg-black/40"
+              onClick={() => setMobileNavOpen(false)}
+              aria-hidden="true"
+            />
+            {/* Panel */}
+            <div className="absolute left-0 top-0 h-full w-72 max-w-[85vw] bg-white dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 shadow-xl flex flex-col">
+              {/* Drawer header */}
+              <div className="flex items-center justify-between h-16 px-3 border-b border-slate-200 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                  <img src="/sla-icon.png" alt="Sri Lakshmi Agro" className="h-6 w-auto object-contain" />
+                  <span className="text-sm font-semibold truncate">{companyName}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setMobileNavOpen(false)}
+                  aria-label="Close navigation"
+                  className="grid h-10 w-10 place-items-center rounded-full border border-emerald-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-emerald-50 dark:hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/30"
+                >
+                  <svg viewBox="0 0 24 24" className="h-5 w-5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                    <path d="M6 6l12 12" />
+                    <path d="M18 6l-12 12" />
+                  </svg>
+                </button>
+              </div>
+
+              {/* Drawer nav items */}
+              <nav className="flex-1 overflow-y-auto py-2" role="navigation">
+                {navItems.map((item) => {
+                  const itemTo = resolveTo(item);
+                  const isActiveKey = activeKey === item.key;
+                  return (
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={() => { onNavigate(item.key); setMobileNavOpen(false); }}
+                      className="w-full text-left"
+                    >
+                      <NavLink
+                        to={itemTo}
+                        end={itemTo ? itemTo.endsWith("/dashboard") : false}
+                        className={({ isActive }) =>
+                          [
+                            "group relative mx-2 my-1 flex items-center rounded-lg px-3 py-2 text-sm transition-colors",
+                            (isActive || isActiveKey)
+                              ? "bg-emerald-600 text-white shadow-sm ring-1 ring-emerald-500/40"
+                              : "text-slate-700 dark:text-slate-300 hover:bg-emerald-50 dark:hover:bg-slate-800",
+                            "justify-start",
+                          ].join(" ")
+                        }
+                      >
+                        <span className="shrink-0">{item.icon ?? defaultIconFor(item.key)}</span>
+                        <span className="ml-3 font-medium truncate">{item.label}</span>
+                      </NavLink>
+                    </button>
+                  );
+                })}
+                {!hasBulk && (
+                  <button
+                    key="bulk"
+                    type="button"
+                    onClick={() => { onNavigate("bulk"); setMobileNavOpen(false); }}
+                    className="w-full text-left"
+                  >
+                    <NavLink
+                      to="/portal/bulk"
+                      className={({ isActive }) =>
+                        [
+                          "group relative mx-2 my-1 flex items-center rounded-lg px-3 py-2 text-sm transition-colors",
+                          (isActive || activeKey === "bulk")
+                            ? "bg-emerald-600 text-white shadow-sm ring-1 ring-emerald-500/40"
+                            : "text-slate-700 dark:text-slate-300 hover:bg-emerald-50 dark:hover:bg-slate-800",
+                          "justify-start",
+                        ].join(" ")
+                      }
+                    >
+                      <span className="shrink-0"><BulkIcon /></span>
+                      <span className="ml-3 font-medium truncate">Bulk Jobs</span>
+                    </NavLink>
+                  </button>
+                )}
+              </nav>
+
+              {/* Drawer footer */}
+              <div className="border-t border-slate-200 dark:border-slate-800 p-3 flex items-center justify-between">
+                <button
+                  onClick={toggleDarkMode}
+                  className="inline-flex items-center gap-2 rounded-md border border-emerald-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-emerald-50 dark:hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/30"
+                >
+                  {darkMode ? <SunIcon className="h-4 w-4" /> : <MoonIcon className="h-4 w-4" />}
+                  <span>Theme</span>
+                </button>
+                <button
+                  onClick={() => {
+                    if (window.confirm("Are you sure you want to log out?")) {
+                      onLogout();
+                      window.location.assign("/login?loggedout=1");
+                    }
+                  }}
+                  className="inline-flex items-center gap-2 rounded-md border border-emerald-200 dark:border-slate-700 bg-white dark:bg-slate-900 px-3 py-2 text-sm hover:bg-emerald-50 dark:hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500/30"
+                >
+                  <PowerIcon className="h-4 w-4" />
+                  <span>Logout</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* Content */}
         <main className="flex-1 overflow-auto p-4 sm:p-6 bg-slate-50/60 dark:bg-slate-950">
