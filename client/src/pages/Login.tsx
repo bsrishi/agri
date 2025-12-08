@@ -1,22 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 
-/**
- * Sri Lakshmi Agro — OTP Login Page
- * - Beautiful, responsive UI with dark-mode awareness
- * - Phone (India by default) -> Send OTP -> Verify OTP
- * - 6-digit OTP inputs with auto-advance & paste support
- * - Subtle animations, accessibility, and keyboard-friendly
- * - No external CSS dependencies; styles included below
- *
- * Backend endpoints (adjust as needed):
- *   POST  {API_BASE}/auth/send-otp      { phone }
- *   POST  {API_BASE}/auth/verify-otp    { phone, otp }
- *
- * Set API base in Vite as VITE_API_URL (e.g., https://agri-api.farmhost.in) or keep empty for same-origin.
- */
-
-// Read and sanitize API base from Vite env. Strip accidental wrapping quotes and trailing slashes.
 function sanitizeBase(u: string): string {
   let s = (u || "").toString().trim();
   // remove leading/trailing single or double quotes if present
@@ -47,10 +31,6 @@ const Login: React.FC = () => {
     ? "You have been successfully logged out. Please login again."
     : null;
   // Delay rendering until notice is initialized to prevent flicker
-  const [ready, setReady] = useState(false);
-  useEffect(() => {
-    setReady(true);
-  }, []);
   const [step, setStep] = useState<"phone" | "otp">("phone");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -233,13 +213,25 @@ const Login: React.FC = () => {
   const canSend = PHONE_REGEX.test(phone.trim()) && !loading;
   const canVerify = otp.every((d) => d) && !loading;
 
-  if (!ready) return null;
   return (
     <div className="sla-login-root">
       <div className="sla-bg" aria-hidden />
-      <main className="sla-card" role="main">
-        <div className="sla-logo-center">
-          <img src="/sla-icon.png" alt="Sri Lakshmi Agro" className="sla-logo" />
+      <div className="sla-card" role="main">
+        <div
+          className="sla-logo-center"
+          style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 200, marginBottom: 16 }}
+        >
+          <img
+            src="/sla-icon.png"
+            alt="Sri Lakshmi Agro"
+            className="sla-logo"
+            width={200}
+            height={200}
+            loading="eager"
+            decoding="async"
+            fetchPriority="high"
+            style={{ width: 200, height: 200, display: 'block' }}
+          />
         </div>
         
         <p className="sla-sub">Secure sign‑in with OTP</p>
@@ -257,11 +249,11 @@ const Login: React.FC = () => {
 
         {step === "phone" && (
           <form onSubmit={onSendOtp} className="sla-form" aria-label="Phone login">
-            <label className="sla-label" htmlFor="phone">Mobile Number</label>
+            <label className="sla-label" htmlFor="pre-phone">Mobile Number</label>
             <div className="sla-input-wrap">
               <span className="sla-prefix">+91</span>
               <input
-                id="phone"
+                id="pre-phone"
                 inputMode="tel"
                 autoComplete="tel"
                 placeholder="9876543210"
@@ -323,13 +315,11 @@ const Login: React.FC = () => {
         <footer className="sla-footer">
           <div className="sla-tn">© {new Date().getFullYear()} Sri Lakshmi Agro • All rights reserved</div>
         </footer>
-      </main>
+      </div>
 
       {/* Inline styles to keep the page self-contained */}
       <style>
         {`
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700;900&display=swap');
         :root { --card-bg: rgba(255,255,255,0.75); --text: #0b1220; --muted: #5b6475; --ring: #5b8a2e; --accent: #7fbf3f; --accent-2: #4e9f3d; --error: #c0392b; --info: #2563eb; }
         @media (prefers-color-scheme: dark) {
           :root { --card-bg: rgba(13,17,23,0.75); --text: #e6edf3; --muted: #9aa4b2; --ring: #9bd35a; --accent: #a8e063; --accent-2: #7cc957; --info: #60a5fa; }

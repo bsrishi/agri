@@ -90,10 +90,18 @@ CREATE TABLE IF NOT EXISTS application_surveys (
   application_id  TEXT NOT NULL REFERENCES applications(application_id) ON DELETE CASCADE,
   survey_no       TEXT NOT NULL,  -- e.g., '362/3'
   subdivision_no  TEXT,           -- keep if you need a separate field
+  district        TEXT,
+  block           TEXT,
+  village         TEXT,
   created_at      TIMESTAMPTZ DEFAULT now(),
   updated_at      TIMESTAMPTZ DEFAULT now(),
   UNIQUE (application_id, survey_no, subdivision_no)
 );
+
+-- Backfill geo columns if migrating an older table
+ALTER TABLE application_surveys ADD COLUMN IF NOT EXISTS district TEXT;
+ALTER TABLE application_surveys ADD COLUMN IF NOT EXISTS block    TEXT;
+ALTER TABLE application_surveys ADD COLUMN IF NOT EXISTS village  TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_app_surveys_app     ON application_surveys (application_id);
 CREATE INDEX IF NOT EXISTS idx_app_surveys_svy     ON application_surveys (survey_no);
@@ -138,9 +146,16 @@ CREATE TABLE IF NOT EXISTS bulk_jobs (
   ok         INTEGER NOT NULL DEFAULT 0,
   error      INTEGER NOT NULL DEFAULT 0,
   status     TEXT NOT NULL DEFAULT 'queued', -- 'queued' | 'running' | 'done' | 'failed'
+  started_at TIMESTAMPTZ,
+  finished_at TIMESTAMPTZ,
+  last_error TEXT,
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now()
 );
+
+ALTER TABLE bulk_jobs ADD COLUMN IF NOT EXISTS started_at  TIMESTAMPTZ;
+ALTER TABLE bulk_jobs ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
+ALTER TABLE bulk_jobs ADD COLUMN IF NOT EXISTS last_error  TEXT;
 
 DROP TRIGGER IF EXISTS trg_bulk_jobs_updated ON bulk_jobs;
 CREATE TRIGGER trg_bulk_jobs_updated
