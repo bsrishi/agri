@@ -219,7 +219,7 @@ export default function Dashboard() {
           <div className="space-y-2 text-sm">
             <Row label="API Health" value={<span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-300"><CheckCircleIcon className="h-4 w-4"/> Healthy</span>} />
             <Row label="TN Sync" value={data?.last_sync ? new Date(data.last_sync).toLocaleString() : "—"} />
-            <Row label="Backend" value={<span className="inline-flex items-center gap-1"><CloudIcon className="h-4 w-4"/> Sri Lakshmi Agro</span>} />
+            <Row label="Backend" value={<span className="inline-flex items-center gap-1"><CloudIcon className="h-4 w-4"/> Nathiya Agri Agency</span>} />
             {error ? (
               <div className="mt-2 rounded-lg border border-rose-300/40 bg-rose-50 dark:border-rose-300/20 dark:bg-rose-500/10 p-2 text-rose-700 dark:text-rose-200">
                 <div className="flex items-center gap-2 text-xs"><ExclamationTriangleIcon className="h-4 w-4"/> {error}</div>

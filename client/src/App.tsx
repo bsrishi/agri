@@ -92,7 +92,7 @@ function PortalLayout({ darkMode, toggleDarkMode }: { darkMode: boolean; toggleD
 
   return (
     <AppShell
-      companyName="Sri Lakshmi Agro"
+      companyName="Nathiya Agri Agency"
       onHome={() => navigate("/portal/dashboard")}
       onLogout={() => { localStorage.removeItem("sla_token"); navigate("/login", { replace: true }); }}
       navItems={navItems}

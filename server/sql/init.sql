@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS users (
 INSERT INTO users (name, phone) VALUES
   ('Prakash', '6369176259'),
   ('Ranjith', '7904576602'),
-  ('Rishi',   '9894064306')
+  ('Rishi',   '9894064306'),
+  ('Nathiya', '9080158580')
 ON CONFLICT (phone) DO NOTHING;
 
 /* ---------------- Applications cache ----------------

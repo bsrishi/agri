@@ -221,17 +221,8 @@ const Login: React.FC = () => {
           className="sla-logo-center"
           style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 200, marginBottom: 16 }}
         >
-          <img
-            src="/sla-icon.png"
-            alt="Sri Lakshmi Agro"
-            className="sla-logo"
-            width={200}
-            height={200}
-            loading="eager"
-            decoding="async"
-            fetchPriority="high"
-            style={{ width: 200, height: 200, display: 'block' }}
-          />
+          {/* Logo removed */}
+          <h1 className="sla-title" style={{ fontSize: '28px', fontWeight: 'bold', color: 'var(--text)', margin: 0 }}>Nathiya Agri Agency</h1>
         </div>
         
         <p className="sla-sub">Secure sign‑in with OTP</p>
@@ -313,7 +304,7 @@ const Login: React.FC = () => {
         )}
 
         <footer className="sla-footer">
-          <div className="sla-tn">© {new Date().getFullYear()} Sri Lakshmi Agro • All rights reserved</div>
+          <div className="sla-tn">© {new Date().getFullYear()} Nathiya Agri Agency • All rights reserved</div>
         </footer>
       </div>
 

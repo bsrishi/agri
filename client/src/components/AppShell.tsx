@@ -4,7 +4,7 @@ import { NavLink } from "react-router-dom";
 import { http } from "../lib/http";
 
 /**
- * Sri Lakshmi Agro – Professional AppShell
+ * Nathiya Agri Agency – Professional AppShell
  * - Green theme, stunning + minimal
  * - Collapsible (explode/implode) sidebar
  * - Dark/Light toggle, Logout, Zoom/Search button in header
@@ -223,13 +223,7 @@ export default function AppShell({
             ].join(" ")}
           >
             {/* Keep logo size constant to avoid flicker/resize */}
-            <div className="h-16 w-16 flex-none flex items-center justify-center">
-              <img
-                src="/sla-icon.png"
-                alt="Sri Lakshmi Agro"
-                className="h-10 w-auto max-w-full object-contain"
-              />
-            </div>
+            {/* Logo removed as per request */}
           </button>
         </div>
 
@@ -512,7 +506,7 @@ export default function AppShell({
               {/* Drawer header */}
               <div className="flex items-center justify-between h-16 px-3 border-b border-slate-200 dark:border-slate-800">
               <div className="flex items-center gap-2">
-                  <img src="/sla-icon.png" alt="Sri Lakshmi Agro" className="h-6 w-auto object-contain" />
+                  {/* <img src="/sla-icon.png" alt="Nathiya Agri" className="h-6 w-auto object-contain" /> */}
                   <span className="text-sm font-semibold truncate">{companyName}</span>
                 </div>
                 <button

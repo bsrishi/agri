@@ -8,7 +8,7 @@ export default {
     extend: {
       colors: {
         brand: {
-          DEFAULT: "#207a57", // Sri Lakshmi Agro green
+          DEFAULT: "#207a57", // Nathiya Agri Agency green
           light: "#4aa87f",
           dark: "#165d43",
         },
